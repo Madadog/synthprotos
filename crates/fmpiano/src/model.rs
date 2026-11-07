@@ -32,7 +32,7 @@ pub struct Tone {
     pub brightness: f32,
     /// Extra brightness that grows with velocity (hammer felt hardness).
     pub hardness: f32,
-    /// Spectral tilt in dB/octave applied to stacks (re. 1 kHz).
+    /// Spectral tilt in dB/octave applied to stacks (re. the fundamental).
     pub tilt: f32,
     /// Multiplier on all decay times.
     pub decay: f32,
@@ -106,7 +106,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             stretch: 1.4,
             hammer: 1.6,
             release: 0.7,
-            gain: 1.1,
+            gain: 1.3,
             ..Tone::GRAND
         },
     ),
@@ -119,7 +119,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             detune: 16.0,
             inharm: 1.6,
             hammer: 1.4,
-            gain: 0.95,
+            gain: 1.12,
             ..Tone::GRAND
         },
     ),
@@ -457,7 +457,9 @@ pub fn voice_spec_with(
         let room = ((nyq - fc) / fm - 2.0).max(0.0) as f32;
         i0 = i0.min(room);
         iinf = iinf.min(room);
-        let tilt = 10f32.powf(tone.tilt * (fc as f32 / 1000.0).log2() / 20.0);
+        // tilt pivots on the fundamental: it reshapes the spectrum without
+        // changing the level of partial 1
+        let tilt = 10f32.powf(tone.tilt * (fc / f1).log2() as f32 / 20.0);
         let g = low_gain * tilt;
         stacks[n] = StackSpec {
             kind: match c {
