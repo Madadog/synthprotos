@@ -1,0 +1,8 @@
+[package]
+name = "fmpiano"
+description = "Piano emulation by FM synthesis, fitted to recordings of a real grand piano"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

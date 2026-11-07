@@ -1,0 +1,13 @@
+[package]
+name = "fmpiano-cli"
+description = "Offline renderer for the FM piano (WAV output, used for analysis against samples)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fmpiano"
+path = "src/main.rs"
+
+[dependencies]
+fmpiano = { path = "../fmpiano" }

@@ -1,0 +1,58 @@
+name: Build and deploy the web demo
+
+on:
+  push:
+    branches: [main, master, ccr-66ba2ab5-scm7wl]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, wasm32 target)
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+
+      - name: Test the synth
+        run: cargo test --release -p fmpiano
+
+      - name: Build WebAssembly
+        run: cargo build --release -p fmpiano-wasm --target wasm32-unknown-unknown
+
+      - name: Assemble site
+        run: |
+          rm -rf _site
+          cp -r docs _site
+          cp target/wasm32-unknown-unknown/release/fmpiano_wasm.wasm _site/fmpiano.wasm
+          ls -la _site
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
