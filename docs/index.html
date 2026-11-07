@@ -32,7 +32,43 @@
       <span id="voices"></span>
     </div>
     <canvas id="scope" aria-label="Output spectrum"></canvas>
-    <p class="hint">Computer keys: <kbd>Z</kbd>…<kbd>/</kbd> (lower row) and <kbd>Q</kbd>…<kbd>]</kbd> (upper row) play from <span id="octname">C3</span>; <kbd>←</kbd>/<kbd>→</kbd> shift by an octave, <kbd>Space</kbd> holds the sustain pedal. MIDI keyboards (and their sustain pedal) work in browsers with Web MIDI.</p>
+    <p class="hint">Computer keys: <kbd>Z</kbd>…<kbd>/</kbd> (lower row) and <kbd>Q</kbd>…<kbd>]</kbd> (upper row) play from <span id="octname">C3</span>; <kbd>←</kbd>/<kbd>→</kbd> shift by an octave, <kbd>Space</kbd> holds the sustain pedal. For a MIDI keyboard, use <a href="#midi">Connect MIDI device</a> below.</p>
+  </section>
+
+  <section class="panel" id="midi">
+    <div class="head">
+      <h2>MIDI <small id="midi-summary" class="muted"></small></h2>
+      <button id="midi-connect" class="primary" disabled>Connect MIDI device</button>
+    </div>
+    <p>Note on/off, velocity, the sustain pedal (CC 64) and all-notes-off are used. The browser asks for permission when you press the button. In Firefox that request takes the form of a small “site permission add-on”, which you need to accept.</p>
+    <div class="midi-grid">
+      <dl class="midi-status">
+        <dt>Web MIDI API</dt><dd id="midi-api">…</dd>
+        <dt>Secure page</dt><dd id="midi-secure">…</dd>
+        <dt>Permission</dt><dd id="midi-perm">…</dd>
+        <dt>Access</dt><dd id="midi-access">not requested yet</dd>
+      </dl>
+      <div>
+        <div class="toolbar">
+          <label>Listen on channel <select id="midi-channel"><option value="-1">all</option></select></label>
+          <label class="chk"><input type="checkbox" id="midi-sysex"> ask for SysEx too</label>
+        </div>
+        <table class="midi-devices"><thead><tr><th>port</th><th>name</th><th>maker</th><th>state</th><th>connection</th></tr></thead><tbody id="midi-devices"></tbody></table>
+      </div>
+    </div>
+    <div class="toolbar log-head"><b>Incoming messages</b> <span id="midi-count" class="muted"></span><button id="midi-clear">Clear</button></div>
+    <pre id="midi-log" aria-live="polite"></pre>
+    <details id="midi-help-firefox">
+      <summary>If it does not work</summary>
+      <ul class="how">
+        <li><b>Firefox</b> (version 108 or later) grants MIDI per site through an automatically generated “site permission add-on”. After pressing <i>Connect</i>, a prompt appears at the left of the address bar asking to add it: choose to continue and add it. If you dismissed or blocked it earlier, Firefox refuses at once (the log shows <code>SecurityError</code>). Remove the old decision under <code>about:addons</code> → <i>Site Permissions</i>, or via the site information icon in the address bar, then press <i>Connect</i> again. The add-on cannot be installed in private windows, and it is disabled when <code>dom.webmidi.enabled</code> is false in <code>about:config</code> or by an enterprise policy.</li>
+        <li><b>Chrome / Edge</b>: allow “Use your MIDI devices” when asked. If you blocked it, open the site information icon in the address bar → <i>Site settings</i> → <i>MIDI devices</i> → <i>Allow</i>, then reload.</li>
+        <li><b>Safari</b> does not support Web MIDI.</li>
+        <li><b>Access granted but no devices</b>: plug the device in (the list updates by itself) and make sure no other program holds it exclusively. On Linux the browser uses ALSA, so the device should be listed by <code>aconnect -l</code>. Some devices only appear after a browser restart.</li>
+        <li><b>Messages arrive but nothing sounds</b>: press <i>Start audio</i> first, and check the channel filter.</li>
+      </ul>
+      <p class="muted">Browser: <code id="midi-browser"></code></p>
+    </details>
   </section>
 
   <section class="panel" id="tone">
@@ -60,7 +96,7 @@
     </div>
     <figure>
       <img src="img/fit_overview.png" alt="Partial envelopes of the recordings (solid) and the FM model (dashed) for several keys" loading="lazy">
-      <figcaption>Partial amplitude envelopes of the recording (solid) and the FM model rendered by the Rust engine (dashed), analysed with the same code. Over all 90 recorded key/dynamic pairs, partials 1–8 match within 4.8&nbsp;dB RMS and the ERB-band spectrogram within 5.8&nbsp;dB (bass and middle 4–5&nbsp;dB, top two octaves 8–9&nbsp;dB). Pitch is within 2&nbsp;cents and the decay rates agree. <a href="img/">Full accuracy report with every comparison</a>.</figcaption>
+      <figcaption>Partial amplitude envelopes of the recording (solid) and the FM model rendered by the Rust engine (dashed), analysed with the same code. Over all 90 recorded key/dynamic pairs, partials 1–8 match within 5.0&nbsp;dB RMS and the ERB-band spectrogram within 5.8&nbsp;dB (bass and middle 4–5&nbsp;dB, top two octaves 8–9&nbsp;dB). Pitch is within 2–3&nbsp;cents and the decay rates agree. <a href="img/">Full accuracy report with every comparison</a>.</figcaption>
     </figure>
   </section>
 
@@ -70,9 +106,9 @@
       <li><b>Stiff strings.</b> A piano string's partials are sharp: <code>f<sub>n</sub> = n·f<sub>0</sub>·√(1 + B·n²)</code>. <i>B</i> was measured on every recorded key (≈7·10⁻⁵ in the tenor up to ≈10⁻² in the top octave). The measured stretched tuning is reproduced too.</li>
       <li><b>FM stacks on the partials.</b> Each note uses up to 14 two-operator FM stacks. A stack's carrier sits on a stretched partial and its modulator runs at the <i>local</i> partial spacing, so the FM sidebands fall onto the neighbouring inharmonic partials. A bass note gets 80+ partials from about a dozen stacks; the stack on partial 1 uses the classic 1:1 ratio. Stacks sit on partials 1, 2, 3, 4, 6, 9, 13, 18, 25, 35, 50 and 70, with extras wherever no sideband would land in tune. Each index is capped so that sidebands beating against the true partial faster than unison strings do stay quiet. In the very stiff top octave this leaves near-pure carriers.</li>
       <li><b>Brightness that decays.</b> Each modulation index falls from <i>I</i><sub>0</sub> towards <i>I</i><sub>∞</sub>, so high partials die faster than low ones, as on a real piano. Harder strikes start with larger indices and sound brighter.</li>
-      <li><b>Prompt sound and aftersound.</b> Each stack's amplitude is the sum of a fast and a slow exponential decay. On the lowest four partials these are separate carriers 1.6 cents apart. The two start in phase, like unison strings struck by one hammer. Together they give the piano's two-stage decay, and their drift produces the beating of real unisons.</li>
+      <li><b>Unison strings.</b> Each stack's amplitude is the sum of a fast and a slow exponential decay: the piano's prompt sound and aftersound. On the lowest four partials they are rendered as the modes of the note's strings. The single-string bass (A0–E1) gets one carrier; string pairs (F1–E2) a prompt and an aftersound carrier; triples (from F2) a prompt and two aftersound carriers. They are spread by the detuning measured between the recorded strings (about 1&nbsp;cent, 2.4&nbsp;cents in the top octaves) and start in phase, like strings struck by one hammer. Their drift produces the beating. The <i>Unison detune</i>, <i>Unison balance</i> and <i>Strings per note</i> controls change it.</li>
       <li><b>Fitted, not tweaked by ear.</b> FM spectra are Bessel functions, so the power each stack puts on each partial is known analytically. A least-squares fit adjusts amplitudes, decay times and index envelopes until the model's partial envelopes (grouped into ERB bands, like the ear) match the recording. That was done for all 30 recorded keys at 9 of the 16 velocity layers; the remaining layers and the 58 unrecorded keys are interpolated.</li>
-      <li><b>The rest.</b> Two noisy feedback-FM pairs model the hammer: a short click and a low thump with a slow tail. They were tuned on the recordings' bands below the fundamental, where the top octaves contain nothing else. Dampers stop notes on key release except in the top octave and a half. The sustain pedal, a small FDN room reverb and stereo key panning complete the instrument. The other tones (bright, mellow, upright, honky-tonk, felt) vary the fitted model physically: hammer hardness, string stiffness, unison detuning and sustain.</li>
+      <li><b>The rest.</b> Three noisy feedback-FM pairs model the hammer and soundboard: a short click, a low thump with a slow tail, and the dense resonance "halo" around treble notes. They were tuned on the recordings' bands below and between the partials, where the top octaves contain little else. Dampers stop notes on key release except in the top octave and a half. The sustain pedal, a small FDN room reverb and stereo key panning complete the instrument. The other tones (bright, mellow, upright, honky-tonk, felt) vary the fitted model physically: hammer hardness, string stiffness, unison detuning and sustain.</li>
     </ul>
     <p>Source code, analysis and fitting tools: <a id="repo-link" href="https://github.com/Madadog/synthprotos">github.com/Madadog/synthprotos</a>.</p>
   </section>

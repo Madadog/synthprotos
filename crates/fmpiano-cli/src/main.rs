@@ -4,6 +4,9 @@
 //!   fmpiano refset --outdir DIR [--dur 10]     # the 30 Salamander keys x 16 layers, dry mono
 //!   fmpiano demo   -o demo.wav [--preset N]
 //!   fmpiano bench
+//!
+//! Every command accepts --preset N and --param ID=VALUE[,ID=VALUE...] (ids in
+//! `fmpiano::param`, e.g. 6 = unison detune, 13 = strings per note).
 
 use fmpiano::{model, param, Synth, PRESETS};
 use std::io::Write;
@@ -103,6 +106,13 @@ fn make_synth(a: &Args) -> Synth {
     let mut s = Synth::new(SR);
     s.set_knock_model(knock_from_env());
     s.set_preset(a.num("--preset", 0.0) as usize);
+    // tone overrides: --param ID=VALUE[,ID=VALUE...] (ids: fmpiano::param)
+    if let Some(list) = a.get("--param") {
+        for kv in list.split(',') {
+            let (id, v) = kv.split_once('=').expect("ID=VALUE");
+            s.set_param(id.parse().expect("param id"), v.parse().expect("value"));
+        }
+    }
     if a.flag("--wet") {
         s.set_param(param::REVERB, 0.18);
     } else {

@@ -23,7 +23,11 @@ pub mod param {
     pub const RELEASE: u32 = 10;
     pub const VEL_CURVE: u32 = 11;
     pub const WIDTH: u32 = 12;
-    pub const COUNT: u32 = 13;
+    /// Strings per note: 0 = as on the recorded grand, 1..=3 forced.
+    pub const STRINGS: u32 = 13;
+    /// Share of the sound between unison strings (beating depth), 0..1.
+    pub const UNISON_MIX: u32 = 14;
+    pub const COUNT: u32 = 15;
 }
 
 struct DcBlock {
@@ -223,13 +227,15 @@ impl Synth {
             HARDNESS => t.hardness = value.clamp(-1.0, 1.0),
             TILT => t.tilt = value.clamp(-12.0, 12.0),
             DECAY => t.decay = value.clamp(0.1, 4.0),
-            DETUNE => t.detune = value.clamp(0.0, 40.0),
+            DETUNE => t.detune = value.clamp(0.0, 12.0),
             STRETCH => t.stretch = value.clamp(0.0, 3.0),
             INHARM => t.inharm = value.clamp(0.0, 8.0),
             HAMMER => t.hammer = value.clamp(0.0, 4.0),
             RELEASE => t.release = value.clamp(0.1, 6.0),
             VEL_CURVE => t.vel_curve = value.clamp(0.3, 3.0),
             WIDTH => self.width = value.clamp(0.0, 2.0),
+            STRINGS => t.strings = value.round().clamp(0.0, 3.0) as u8,
+            UNISON_MIX => t.unison_mix = value.clamp(0.0, 1.0),
             _ => {}
         }
     }
@@ -251,6 +257,8 @@ impl Synth {
             RELEASE => t.release,
             VEL_CURVE => t.vel_curve,
             WIDTH => self.width,
+            STRINGS => t.strings as f32,
+            UNISON_MIX => t.unison_mix,
             _ => 0.0,
         }
     }

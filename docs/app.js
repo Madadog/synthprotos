@@ -4,15 +4,25 @@
 const P = {
   VOLUME: 0, REVERB: 1, BRIGHTNESS: 2, HARDNESS: 3, TILT: 4, DECAY: 5, DETUNE: 6,
   STRETCH: 7, INHARM: 8, HAMMER: 9, RELEASE: 10, VEL_CURVE: 11, WIDTH: 12,
+  STRINGS: 13, UNISON_MIX: 14, COUNT: 15,
 };
 
-// slider definitions: [param, label, min, max, step, hint, format]
+// tone controls: sliders [param, label, min, max, step, hint, format] or
+// selects [param, label, [[value, text], ...], hint]
+const UNISON_C4_CENTS = 1.0; // measured unison spread around middle C
 const SLIDERS = [
   [P.BRIGHTNESS, 'Brightness', 0.3, 2.0, 0.01, 'scales every FM modulation index', (v) => `×${v.toFixed(2)}`],
   [P.HARDNESS, 'Hammer hardness', -1, 1, 0.01, 'extra brightness for hard strikes', (v) => v.toFixed(2)],
   [P.TILT, 'Spectral tilt', -8, 6, 0.1, 'dB per octave above the fundamental', (v) => `${v.toFixed(1)} dB/oct`],
   [P.DECAY, 'Sustain length', 0.2, 3, 0.01, 'scales all decay times', (v) => `×${v.toFixed(2)}`],
-  [P.DETUNE, 'Unison detune', 0, 30, 0.1, 'cents between the two carrier copies', (v) => `${v.toFixed(1)} ¢`],
+  [P.DETUNE, 'Unison detune (beating speed)', 0, 10, 0.05,
+    '× the detuning measured between each note\'s strings: ≈1 ¢ up to C5, 2.4 ¢ in the top octaves; 0 = perfectly tuned',
+    (v) => `×${v.toFixed(2)} · ${(v * UNISON_C4_CENTS).toFixed(1)} ¢ at C4`],
+  [P.UNISON_MIX, 'Unison balance (beating depth)', 0, 1, 0.01,
+    '0 = as recorded: prompt sound on one string, aftersound on the others; 1 = equal shares, deep beating throughout',
+    (v) => v.toFixed(2)],
+  [P.STRINGS, 'Strings per note', [[0, 'As on the recorded grand: 1 · 2 · 3'], [1, '1 string (no unison)'], [2, '2 strings'], [3, '3 strings']],
+    'grand: single strings A0–E1, pairs F1–E2, triples from F2'],
   [P.INHARM, 'String stiffness', 0, 5, 0.01, 'inharmonicity B (×measured)', (v) => `×${v.toFixed(2)}`],
   [P.STRETCH, 'Octave stretch', 0, 2, 0.01, '0 = equal temperament', (v) => `×${v.toFixed(2)}`],
   [P.HAMMER, 'Hammer noise', 0, 3, 0.01, 'level of the FM knock burst', (v) => `×${v.toFixed(2)}`],
@@ -91,14 +101,13 @@ async function startAudio() {
   node.connect(analyser);
   // mirror the UI state into the audio engine
   send({ t: 'preset', i: Number($('preset').value) });
-  for (let id = 0; id <= P.WIDTH; id++) send({ t: 'param', id, v: ui.fmp_get_param(uiEngine, id) });
+  for (let id = 0; id < P.COUNT; id++) send({ t: 'param', id, v: ui.fmp_get_param(uiEngine, id) });
   if (ctx.state !== 'running') await ctx.resume();
   $('power').textContent = 'Audio on';
   $('power').classList.remove('primary');
   $('status').textContent = `Running at ${ctx.sampleRate} Hz, ${Math.round((ctx.baseLatency || 0) * 1000)} ms buffer.`;
   for (const id of ['ab-fm', 'ab-ref', 'ab-both', 'ab-stop']) $(id).disabled = false;
   drawScope();
-  initMidi();
 }
 
 function noteOn(key, vel, src) {
@@ -243,30 +252,160 @@ function initComputerKeys() {
   });
 }
 
-// Web MIDI
-async function initMidi() {
-  if (!navigator.requestMIDIAccess) return;
-  try {
-    const access = await navigator.requestMIDIAccess();
-    const hook = () => {
-      let n = 0;
-      for (const input of access.inputs.values()) {
-        n++;
-        input.onmidimessage = (msg) => {
-          const [st, a, b] = msg.data;
-          const cmd = st & 0xf0;
-          if (cmd === 0x90 && b > 0) noteOn(a, b, 'm' + a);
-          else if (cmd === 0x80 || (cmd === 0x90 && b === 0)) noteOff('m' + a, a);
-          else if (cmd === 0xb0 && a === 64) setSustain(b >= 64);
-          else if (cmd === 0xb0 && (a === 120 || a === 123)) send({ t: 'alloff' });
-        };
+// ------------------------------------------------------------------ Web MIDI
+const midiState = { access: null, count: 0, lines: [] };
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function midiLog(text) {
+  const t = (performance.now() / 1000).toFixed(3).padStart(8);
+  midiState.lines.push(`${t}  ${text}`);
+  if (midiState.lines.length > 300) midiState.lines.shift();
+  const el = $('midi-log');
+  el.textContent = midiState.lines.join('\n');
+  el.scrollTop = el.scrollHeight;
+}
+
+function describeMidi(d) {
+  const [st, a, b] = d;
+  const ch = (st & 0x0f) + 1;
+  const cc = { 1: ' (mod wheel)', 7: ' (volume)', 64: ' (sustain pedal)', 66: ' (sostenuto)', 67: ' (soft pedal)', 120: ' (all sound off)', 123: ' (all notes off)' };
+  switch (st & 0xf0) {
+    case 0x80: return `ch${ch} note off ${noteName(a)} (${a}) vel ${b}`;
+    case 0x90: return b ? `ch${ch} note on  ${noteName(a)} (${a}) vel ${b}` : `ch${ch} note off ${noteName(a)} (${a}) (on, vel 0)`;
+    case 0xa0: return `ch${ch} key pressure ${noteName(a)} ${b}`;
+    case 0xb0: return `ch${ch} control ${a} = ${b}${cc[a] || ''}`;
+    case 0xc0: return `ch${ch} program change ${a + 1}`;
+    case 0xd0: return `ch${ch} channel pressure ${a}`;
+    case 0xe0: return `ch${ch} pitch bend ${((b << 7) | a) - 8192}`;
+    default: return st === 0xf0 ? 'system exclusive' : `system message 0x${st.toString(16)}`;
+  }
+}
+
+function onMidiMessage(ev) {
+  const d = ev.data;
+  if (!d || !d.length || d[0] === 0xf8 || d[0] === 0xfe) return; // clock, active sensing
+  midiState.count++;
+  $('midi-count').textContent = `${midiState.count} message${midiState.count === 1 ? '' : 's'} received`;
+  const st = d[0];
+  const chSel = Number($('midi-channel').value);
+  const used = st < 0xf0 && (chSel < 0 || chSel === (st & 0x0f));
+  const hex = Array.from(d.slice(0, 3), (x) => x.toString(16).padStart(2, '0')).join(' ');
+  const port = (ev.target && ev.target.name) || 'input';
+  midiLog(`${port.slice(0, 22).padEnd(22)}  ${hex.padEnd(8)}  ${describeMidi(d)}${used || st >= 0xf0 ? '' : '   (other channel, ignored)'}`);
+  if (!used) return;
+  const [, a, b] = d;
+  const cmd = st & 0xf0;
+  if (cmd === 0x90 && b > 0) {
+    if (!ctx) midiLog('    audio is off: click "Start audio" first (browsers only start sound after a click)');
+    noteOn(a, b, 'm' + a);
+  } else if (cmd === 0x80 || (cmd === 0x90 && b === 0)) noteOff('m' + a, a);
+  else if (cmd === 0xb0 && a === 64) setSustain(b >= 64);
+  else if (cmd === 0xb0 && (a === 120 || a === 123)) send({ t: 'alloff' });
+}
+
+function refreshMidiDevices() {
+  const acc = midiState.access;
+  const rows = [];
+  if (acc) {
+    for (const port of [...acc.inputs.values(), ...acc.outputs.values()]) {
+      if (port.type === 'input' && port.onmidimessage !== onMidiMessage) {
+        port.onmidimessage = onMidiMessage;
+        if (port.open) port.open().catch((e) => midiLog(`could not open "${port.name}": ${e.name}: ${e.message}`));
       }
-      if (n) $('status').textContent += ` MIDI: ${n} input${n > 1 ? 's' : ''} connected.`;
+      rows.push(`<tr><td>${port.type}</td><td>${esc(port.name || '?')}</td><td>${esc(port.manufacturer || '')}</td><td>${port.state}</td><td>${port.connection}</td></tr>`);
+    }
+  }
+  $('midi-devices').innerHTML = rows.length ? rows.join('')
+    : `<tr><td colspan="5">${acc ? 'Access granted, but the browser reports no MIDI devices. Plug one in (the list updates by itself) or check the notes below.' : 'Not connected yet: press “Connect MIDI device”.'}</td></tr>`;
+  const n = acc ? acc.inputs.size : 0;
+  $('midi-summary').textContent = acc ? `${n} input${n === 1 ? '' : 's'}` : 'not connected';
+}
+
+async function queryMidiPermission() {
+  const out = $('midi-perm');
+  if (!navigator.permissions || !navigator.permissions.query) {
+    out.textContent = 'cannot be queried in this browser';
+    return null;
+  }
+  try {
+    const st = await navigator.permissions.query({ name: 'midi', sysex: $('midi-sysex').checked });
+    out.textContent = st.state;
+    st.onchange = () => { out.textContent = st.state; midiLog(`permission is now: ${st.state}`); };
+    return st.state;
+  } catch (e) {
+    out.textContent = `cannot be queried in this browser (${e.name})`;
+    return null;
+  }
+}
+
+function midiFail(e) {
+  const name = (e && e.name) || 'Error';
+  $('midi-access').textContent = `refused: ${name}`;
+  midiLog(`requestMIDIAccess failed: ${name}: ${(e && e.message) || e}`);
+  const hints = {
+    SecurityError: 'Permission was refused. In Firefox this is what happens when the "site permission add-on" prompt is dismissed, blocked, or not available (e.g. in a private window). See "If it does not work" below, then press Connect again.',
+    NotAllowedError: 'Permission was refused. See "If it does not work" below.',
+    AbortError: 'The request was cancelled before it finished (for example the add-on install was cancelled).',
+    NotSupportedError: 'The browser refused this kind of request (try without SysEx).',
+    InvalidStateError: 'The browser could not start its MIDI service. Close other programs that may hold the device and restart the browser.',
+  };
+  if (hints[name]) midiLog(`    ${hints[name]}`);
+  queryMidiPermission();
+}
+
+// Must run synchronously inside a click so the browser can show its prompt
+// (Firefox requires that to offer its site-permission add-on).
+function connectMidi(fromClick) {
+  if (!('requestMIDIAccess' in navigator)) {
+    midiLog('navigator.requestMIDIAccess does not exist in this browser.');
+    return;
+  }
+  const sysex = $('midi-sysex').checked;
+  midiLog(`requesting MIDI access${sysex ? ' (with SysEx)' : ''}…`);
+  $('midi-access').textContent = 'waiting for the browser (look for a prompt near the address bar)';
+  let req;
+  try {
+    req = navigator.requestMIDIAccess({ sysex });
+  } catch (e) {
+    midiFail(e);
+    return;
+  }
+  if (fromClick && !ctx) startAudio(); // the same click can also unlock sound
+  req.then((acc) => {
+    midiState.access = acc;
+    acc.onstatechange = (e) => {
+      midiLog(`${e.port.type} "${e.port.name}" is ${e.port.state} / ${e.port.connection}`);
+      refreshMidiDevices();
     };
-    hook();
-    access.onstatechange = hook;
-  } catch (_) {
-    /* MIDI permission denied or unavailable */
+    $('midi-access').textContent = `granted${acc.sysexEnabled ? ' (SysEx too)' : ''}`;
+    midiLog(`access granted: ${acc.inputs.size} input(s), ${acc.outputs.size} output(s)`);
+    refreshMidiDevices();
+    queryMidiPermission();
+  }, midiFail);
+}
+
+async function initMidiPanel() {
+  const hasApi = 'requestMIDIAccess' in navigator;
+  const ua = navigator.userAgent;
+  const firefox = /firefox\//i.test(ua);
+  $('midi-api').textContent = hasApi ? 'available' : (/safari/i.test(ua) && !/chrome|chromium|android/i.test(ua) ? 'not available: Safari does not implement Web MIDI' : 'not available in this browser');
+  $('midi-secure').textContent = window.isSecureContext ? 'yes' : 'no: Web MIDI only works on https:// pages (or localhost)';
+  $('midi-browser').textContent = ua;
+  if (firefox) $('midi-help-firefox').open = true;
+  const ch = $('midi-channel');
+  for (let i = 0; i < 16; i++) ch.insertAdjacentHTML('beforeend', `<option value="${i}">${i + 1}</option>`);
+  $('midi-connect').disabled = !hasApi;
+  $('midi-connect').addEventListener('click', () => connectMidi(true));
+  $('midi-clear').addEventListener('click', () => { midiState.lines = []; midiState.count = 0; $('midi-log').textContent = ''; $('midi-count').textContent = ''; });
+  $('midi-sysex').addEventListener('change', queryMidiPermission);
+  refreshMidiDevices();
+  if (!hasApi) return;
+  const state = await queryMidiPermission();
+  if (state === 'granted') {
+    midiLog('MIDI permission was granted before: connecting without a prompt.');
+    connectMidi(false);
+  } else {
+    midiLog('Press "Connect MIDI device" to ask the browser for access.');
   }
 }
 
@@ -274,7 +413,23 @@ async function initMidi() {
 const sliderEls = {};
 function buildSliders() {
   const box = $('sliders');
-  for (const [id, label, min, max, step, hint, fmt] of SLIDERS) {
+  for (const def of SLIDERS) {
+    if (Array.isArray(def[2])) {
+      const [id, label, options, hint] = def;
+      const wrap = document.createElement('label');
+      wrap.className = 'slider';
+      wrap.innerHTML = `<span>${label}</span><output></output><select>${options.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select><small>${hint}</small>`;
+      const sel = wrap.querySelector('select');
+      sel.addEventListener('change', () => {
+        const v = Number(sel.value);
+        ui.fmp_set_param(uiEngine, id, v);
+        send({ t: 'param', id, v });
+      });
+      sliderEls[id] = { input: sel, out: wrap.querySelector('output'), fmt: () => '' };
+      box.appendChild(wrap);
+      continue;
+    }
+    const [id, label, min, max, step, hint, fmt] = def;
     const wrap = document.createElement('label');
     wrap.className = 'slider';
     wrap.innerHTML = `<span>${label}</span><output></output><input type="range" min="${min}" max="${max}" step="${step}">${hint ? `<small>${hint}</small>` : ''}`;
@@ -418,6 +573,7 @@ async function main() {
   buildKeyboard();
   initComputerKeys();
   buildSliders();
+  initMidiPanel();
   const vel = $('velocity');
   vel.addEventListener('input', () => { $('velout').textContent = vel.value; });
   $('sustain').addEventListener('click', async () => { if (!ctx) await startAudio(); setSustain(!sustainDown); });

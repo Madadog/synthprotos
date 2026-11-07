@@ -13,6 +13,10 @@ fn decay_coef(tau: f32, sr: f32) -> f32 {
     }
 }
 
+/// One FM stack: a modulator and up to three carriers, one per unison string
+/// (the 1:1 stack gives every copy its own modulator so each stays exactly
+/// 1:1).  All copies share the prompt and aftersound envelopes; `w` says how
+/// much of each a copy carries.
 #[derive(Clone, Copy, Default)]
 struct StackState {
     kind: StackKind,
@@ -20,14 +24,21 @@ struct StackState {
     dm1: u32,
     pm2: u32,
     dm2: u32,
+    pm3: u32,
+    dm3: u32,
     pc1: u32,
     dc1: u32,
     pc2: u32,
     dc2: u32,
+    pc3: u32,
+    dc3: u32,
+    /// prompt and aftersound envelopes
     a1: f32,
     k1: f32,
     a2: f32,
     k2: f32,
+    /// per string copy: share of prompt and of aftersound
+    w: [[f32; 2]; 3],
     /// index = iinf + ix, with ix decaying by kix per sample
     ix: f32,
     kix: f32,
@@ -35,27 +46,35 @@ struct StackState {
 }
 
 impl StackState {
-    fn new(s: &StackSpec, detune: f64, sr: f32) -> Self {
+    fn new(s: &StackSpec, unison: &[f64; 3], weights: &[[f32; 2]; 3], sr: f32) -> Self {
         let srd = sr as f64;
-        let (fc2, fm2) = match s.kind {
-            StackKind::Single => (s.fc, s.fm),
-            StackKind::Dual => (s.fc * detune, s.fm),
-            StackKind::DualMod => (s.fc * detune, s.fm * detune),
-        };
+        let own_mod = matches!(s.kind, StackKind::DualMod | StackKind::TripleMod);
+        let single = s.kind == StackKind::Single;
+        let u = if single { [1.0; 3] } else { *unison };
+        let fm = |k: usize| if own_mod { s.fm * u[k] } else { s.fm };
         StackState {
             kind: s.kind,
             pm1: 0,
-            dm1: phase_inc(s.fm, srd),
+            dm1: phase_inc(fm(0), srd),
             pm2: 0,
-            dm2: phase_inc(fm2, srd),
+            dm2: phase_inc(fm(1), srd),
+            pm3: 0,
+            dm3: phase_inc(fm(2), srd),
             pc1: 0,
-            dc1: phase_inc(s.fc, srd),
+            dc1: phase_inc(s.fc * u[0], srd),
             pc2: 0,
-            dc2: phase_inc(fc2, srd),
+            dc2: phase_inc(s.fc * u[1], srd),
+            pc3: 0,
+            dc3: phase_inc(s.fc * u[2], srd),
             a1: s.a1,
             k1: decay_coef(s.tau1, sr),
             a2: s.a2,
             k2: decay_coef(s.tau2, sr),
+            w: if single {
+                [[1.0, 1.0], [0.0; 2], [0.0; 2]]
+            } else {
+                *weights
+            },
             ix: s.i0 - s.iinf,
             kix: decay_coef(s.taui, sr),
             iinf: s.iinf,
@@ -76,14 +95,19 @@ impl StackState {
         let nu = n as u32;
         self.pm1 = self.pm1.wrapping_add(self.dm1.wrapping_mul(nu));
         self.pm2 = self.pm2.wrapping_add(self.dm2.wrapping_mul(nu));
+        self.pm3 = self.pm3.wrapping_add(self.dm3.wrapping_mul(nu));
         self.pc1 = self.pc1.wrapping_add(self.dc1.wrapping_mul(nu));
         self.pc2 = self.pc2.wrapping_add(self.dc2.wrapping_mul(nu));
+        self.pc3 = self.pc3.wrapping_add(self.dc3.wrapping_mul(nu));
     }
 
     fn render(&mut self, tab: &SineTable, out: &mut [f32]) {
-        let (mut pm1, dm1, mut pm2, dm2) = (self.pm1, self.dm1, self.pm2, self.dm2);
-        let (mut pc1, dc1, mut pc2, dc2) = (self.pc1, self.dc1, self.pc2, self.dc2);
+        let (mut pm1, dm1, mut pm2, dm2, mut pm3, dm3) =
+            (self.pm1, self.dm1, self.pm2, self.dm2, self.pm3, self.dm3);
+        let (mut pc1, dc1, mut pc2, dc2, mut pc3, dc3) =
+            (self.pc1, self.dc1, self.pc2, self.dc2, self.pc3, self.dc3);
         let (mut a1, k1, mut a2, k2) = (self.a1, self.k1, self.a2, self.k2);
+        let [[p1, q1], [p2, q2], [p3, q3]] = self.w;
         let (mut ix, kix, iinf) = (self.ix, self.kix, self.iinf);
         match self.kind {
             StackKind::Single => {
@@ -100,7 +124,8 @@ impl StackState {
             StackKind::Dual => {
                 for o in out.iter_mut() {
                     let off = rad_to_phase(tab.sin(pm1) * (iinf + ix));
-                    *o += tab.sin(pc1.wrapping_add(off)) * a1 + tab.sin(pc2.wrapping_add(off)) * a2;
+                    *o += tab.sin(pc1.wrapping_add(off)) * (p1 * a1 + q1 * a2)
+                        + tab.sin(pc2.wrapping_add(off)) * (p2 * a1 + q2 * a2);
                     ix *= kix;
                     a1 *= k1;
                     a2 *= k2;
@@ -114,7 +139,8 @@ impl StackState {
                     let i = iinf + ix;
                     let o1 = rad_to_phase(tab.sin(pm1) * i);
                     let o2 = rad_to_phase(tab.sin(pm2) * i);
-                    *o += tab.sin(pc1.wrapping_add(o1)) * a1 + tab.sin(pc2.wrapping_add(o2)) * a2;
+                    *o += tab.sin(pc1.wrapping_add(o1)) * (p1 * a1 + q1 * a2)
+                        + tab.sin(pc2.wrapping_add(o2)) * (p2 * a1 + q2 * a2);
                     ix *= kix;
                     a1 *= k1;
                     a2 *= k2;
@@ -124,11 +150,48 @@ impl StackState {
                     pc2 = pc2.wrapping_add(dc2);
                 }
             }
+            StackKind::Triple => {
+                for o in out.iter_mut() {
+                    let off = rad_to_phase(tab.sin(pm1) * (iinf + ix));
+                    *o += tab.sin(pc1.wrapping_add(off)) * (p1 * a1 + q1 * a2)
+                        + tab.sin(pc2.wrapping_add(off)) * (p2 * a1 + q2 * a2)
+                        + tab.sin(pc3.wrapping_add(off)) * (p3 * a1 + q3 * a2);
+                    ix *= kix;
+                    a1 *= k1;
+                    a2 *= k2;
+                    pm1 = pm1.wrapping_add(dm1);
+                    pc1 = pc1.wrapping_add(dc1);
+                    pc2 = pc2.wrapping_add(dc2);
+                    pc3 = pc3.wrapping_add(dc3);
+                }
+            }
+            StackKind::TripleMod => {
+                for o in out.iter_mut() {
+                    let i = iinf + ix;
+                    let o1 = rad_to_phase(tab.sin(pm1) * i);
+                    let o2 = rad_to_phase(tab.sin(pm2) * i);
+                    let o3 = rad_to_phase(tab.sin(pm3) * i);
+                    *o += tab.sin(pc1.wrapping_add(o1)) * (p1 * a1 + q1 * a2)
+                        + tab.sin(pc2.wrapping_add(o2)) * (p2 * a1 + q2 * a2)
+                        + tab.sin(pc3.wrapping_add(o3)) * (p3 * a1 + q3 * a2);
+                    ix *= kix;
+                    a1 *= k1;
+                    a2 *= k2;
+                    pm1 = pm1.wrapping_add(dm1);
+                    pm2 = pm2.wrapping_add(dm2);
+                    pm3 = pm3.wrapping_add(dm3);
+                    pc1 = pc1.wrapping_add(dc1);
+                    pc2 = pc2.wrapping_add(dc2);
+                    pc3 = pc3.wrapping_add(dc3);
+                }
+            }
         }
         self.pm1 = pm1;
         self.pm2 = pm2;
+        self.pm3 = pm3;
         self.pc1 = pc1;
         self.pc2 = pc2;
+        self.pc3 = pc3;
         self.a1 = a1;
         self.a2 = a2;
         self.ix = ix;
@@ -314,7 +377,7 @@ impl Voice {
         self.serial = serial;
         self.n = spec.n;
         for (st, sp) in self.stacks.iter_mut().zip(spec.stacks[..spec.n].iter()) {
-            *st = StackState::new(sp, spec.detune_ratio, sr);
+            *st = StackState::new(sp, &spec.unison, &spec.weights, sr);
         }
         self.knock = KnockState::new(&spec.knock, sr);
         self.att = 1.0;

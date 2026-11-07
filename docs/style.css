@@ -110,3 +110,23 @@ footer { color: var(--muted); font-size: 13.5px; padding-bottom: 32px; }
   header h1 { font-size: 24px; }
   #keyboard { height: 150px; }
 }
+
+.muted { color: var(--muted); font-weight: normal; }
+.panel h2 small { font-size: 14px; margin-left: 6px; }
+.slider select { grid-column: 1 / -1; width: 100%; }
+.midi-grid { display: grid; grid-template-columns: minmax(220px, 1fr) 2fr; gap: 12px 24px; align-items: start; }
+.midi-status { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 14px; }
+.midi-status dt { color: var(--muted); }
+.midi-status dd { margin: 0; overflow-wrap: anywhere; }
+.midi-devices { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.midi-devices th, .midi-devices td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.log-head { margin: 12px 0 6px; }
+.log-head button { margin-left: auto; }
+#midi-log {
+  height: 180px; overflow: auto; margin: 0; padding: 8px 10px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre;
+}
+#midi details, details#midi-help-firefox { margin-top: 10px; }
+details summary { cursor: pointer; font-weight: 600; }
+@media (max-width: 700px) { .midi-grid { grid-template-columns: 1fr; } }

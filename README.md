@@ -23,7 +23,7 @@ score the Rust engine's output against them with the same analysis code.
 | Dense spectra (80+ partials in the bass) | Up to 14 two-operator **stacks** per note. A stack's carrier sits on partial *c*. Its modulator runs at the *local* partial spacing, so the sidebands `f_c ± j·f_m` land on the neighbouring inharmonic partials. The stack on partial 1 uses the classic 1:1 ratio. |
 | Sidebands must stay in tune | Stacks sit on partials 1, 2, 3, 4, 6, 9, 13, 18, 25, 35, 50, 70 (up to the last audible partial). More are added wherever no stack's sideband reaches a partial in tune. Each stack's modulation index is capped so that sidebands beating against the true partial by more than min(⅕ ERB, 12 Hz) stay ~20 dB down. In the top octaves (very stiff strings) this turns the stacks into near-pure carriers. |
 | Upper partials decay faster | Each modulation index decays from *I₀* to *I∞*, so FM brightness falls over time. |
-| Two-stage decay and unison beating ("prompt sound" and "aftersound") | Each stack's envelope is a fast plus a slow exponential. On partials 1–4 these are two carriers 1.6 cents apart, starting in phase like unison strings; their drift gives the beating. |
+| Two-stage decay and unison beating ("prompt sound" and "aftersound"); 1, 2 or 3 strings per note | Each stack's envelope is a fast plus a slow exponential. On partials 1–4 they are rendered as the modes of the note's unison strings: one carrier for single strings, prompt and aftersound carriers for string pairs, and a prompt plus two aftersound carriers for triples. The carriers are spread by the unison detuning measured on the recordings and start in phase, like strings struck by one hammer. Their drift gives the beating. |
 | Harder strikes are brighter | Index and amplitude envelopes are fitted separately for every velocity layer. |
 | Hammer knock and action thump | Two noisy feedback-FM pairs: a short broadband click, plus a low thump with a slow tail that dominates the attack of the top octaves. They were tuned on the bands below the fundamental. |
 | Dampers, pedal, room | Damper release, with no dampers above F#6. Sustain pedal, an 8-line FDN reverb, and key panning. |
@@ -49,6 +49,28 @@ smooth in velocity; the remaining layers are interpolated. `export_tables.py` tu
 `crates/fmpiano/src/tables.rs`, and the engine interpolates between keys and
 layers.
 
+### Unison strings
+
+`tools/analysis/unison.py` splits every partial of the recordings into its
+components with ESPRIT, a high-resolution subspace method. A0, C1 and D#1
+have a single component per partial (any second one sits around −40 dB):
+these are single strings. From F#1 up, partials show several strong
+components within about a cent of each other. Their spread is about 1 cent up
+to C5 and about 2.4 cents in the top octaves, and the engine uses this as the
+unison detuning. Pairs and triples cannot be told apart in the recordings
+(two strings with two polarisations also give 3–4 components). So the usual
+layout of a grand this size is used: single strings A0–E1, pairs F1–E2,
+triples from F2.
+
+Three tone controls (also on the web page) adjust this:
+
+* **Unison detune**: a multiplier on the measured spread, i.e. beating speed
+  (0 = perfectly tuned unisons).
+* **Unison balance**: 0 keeps the prompt sound on one string and the aftersound
+  on the other(s), which is closest to the recordings in the comparison; 1
+  shares both equally between the strings, giving deep beating throughout.
+* **Strings per note**: as on the recorded grand, or 1, 2 or 3 everywhere.
+
 ### Accuracy
 
 Engine renders (dry, mono) compared with the recordings by
@@ -59,12 +81,12 @@ is the RMS difference of time-smoothed ERB-band spectrograms from 10 ms to
 
 | keys | band, p | band, mf | band, ff | partials 1–8 | pitch error (median) | early decay, FM / recording |
 |---|---|---|---|---|---|---|
-| A0–A1 (bass) | 3.9 dB | 3.8 dB | 4.6 dB | 6.0 dB | 2.4 ¢ | −5 / −5 dB/s |
-| C2–A3 (tenor) | 4.7 dB | 4.6 dB | 4.6 dB | 4.8 dB | 1.9 ¢ | −12 / −12 dB/s |
-| C4–A5 (middle) | 4.6 dB | 4.6 dB | 4.9 dB | 4.1 dB | 1.1 ¢ | −29 / −27 dB/s |
-| C6–C8 (treble) | 8.9 dB | 8.5 dB | 8.7 dB | 4.9 dB | 2.3 ¢ | −23 / −23 dB/s |
+| A0–A1 (bass) | 3.9 dB | 3.8 dB | 4.6 dB | 6.1 dB | 2.4 ¢ | −5 / −5 dB/s |
+| C2–A3 (tenor) | 4.7 dB | 4.6 dB | 4.6 dB | 4.9 dB | 2.0 ¢ | −11 / −12 dB/s |
+| C4–A5 (middle) | 4.5 dB | 4.6 dB | 5.0 dB | 4.2 dB | 1.3 ¢ | −26 / −27 dB/s |
+| C6–C8 (treble) | 8.9 dB | 8.5 dB | 8.8 dB | 5.2 dB | 2.7 ¢ | −24 / −23 dB/s |
 
-Over all 90: band error 5.8 dB (median 5.0), partials 4.8 dB, median peak-level
+Over all 90: band error 5.8 dB (median 5.0), partials 5.0 dB, median peak-level
 difference 1.3 dB. For scale, per-partial double-exponential envelopes (an
 additive model with a free envelope for every partial) reach about 1.3–2.4 dB
 on the same data. The remaining treble error is mostly the noisy
@@ -85,7 +107,8 @@ crates/fmpiano/        the synthesiser (pure Rust, no dependencies)
 crates/fmpiano-wasm/   C-ABI exports for the browser (no wasm-bindgen)
 crates/fmpiano-cli/    offline renderer (WAV) used for the comparisons
 docs/                  the GitHub Pages site (AudioWorklet + UI)
-tools/analysis/        pitch/inharmonicity/partial-envelope analysis, comparison report
+tools/analysis/        pitch/inharmonicity/partial-envelope analysis, unison-string (ESPRIT)
+                       analysis, comparison report
 tools/fit/             model fitting, knock tuning, table export; results/ holds the fit
 ```
 
@@ -118,6 +141,24 @@ python3 tools/analysis/compare.py out/refset --layers 4,10,16 --plots docs/img -
 
 `tools/fit/results/` contains the fit used for the current tables, so
 `export_tables.py tools/fit/results` regenerates them without refitting.
+
+## MIDI
+
+The page's MIDI panel asks for access only when you press **Connect MIDI
+device**. Doing it from a click lets the browser show its prompt. The panel
+shows whether Web MIDI exists, whether the page is a secure context, the
+permission state, every port the browser reports, and a decoded log of
+incoming messages, with explanations when a request is refused.
+
+* **Firefox** (108+) grants MIDI per site with an automatically generated
+  "site permission add-on": accept the prompt next to the address bar. If it
+  was dismissed before, the request fails at once with `SecurityError`.
+  Remove the old decision in `about:addons` → *Site Permissions*, or in the
+  site information panel, and connect again. Private windows cannot install
+  the add-on.
+* **Chrome / Edge**: allow "Use your MIDI devices"; re-enable it under Site
+  settings → MIDI devices if it was blocked.
+* **Safari** has no Web MIDI.
 
 ## GitHub Pages
 

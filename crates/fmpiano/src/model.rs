@@ -14,10 +14,14 @@
 //! harmonics, the classic FM piano/e-piano spectrum).
 //!
 //! Amplitude envelopes are two decaying exponentials (the piano's "prompt
-//! sound" and "aftersound"), rendered on two slightly detuned carriers so the
-//! hand-over between them produces the beating of real unison strings.  The
-//! modulation index decays from `I0` to `I∞`, which makes the upper partials
-//! die away faster than the lower ones.
+//! sound" and "aftersound").  On the lowest partials they are rendered as the
+//! normal modes of the note's unison strings: a single carrier for the
+//! single-string bass notes, a prompt and an aftersound carrier half the
+//! unison spread either side of the pitch for string pairs, and a prompt plus
+//! two aftersound carriers for string triples.  They start in phase, like
+//! strings struck by one hammer, and drift apart, which produces the beating
+//! of real unisons.  The modulation index decays from `I0` to `I∞`, which
+//! makes the upper partials die away faster than the lower ones.
 //!
 //! All envelope/index parameters were fitted to the Salamander Grand Piano V3
 //! recordings (see `tools/fit`); they live in [`crate::tables`] for 30 keys ×
@@ -36,8 +40,17 @@ pub struct Tone {
     pub tilt: f32,
     /// Multiplier on all decay times.
     pub decay: f32,
-    /// Detuning between the two carrier copies in cents (unison beating).
+    /// Multiplier on the measured detuning between a note's unison strings
+    /// (beating speed); 0 = perfectly tuned unisons.
     pub detune: f32,
+    /// Strings per note: 0 = as on the recorded grand (1 / 2 / 3 by
+    /// register, see [`unison_strings`]); 1..=3 forces that many everywhere.
+    pub strings: u8,
+    /// How evenly the sound is shared between the unison strings: 0 = the
+    /// prompt sound on one string and the aftersound on the other(s) (beating
+    /// only while one hands over to the other), 1 = every string carries an
+    /// equal share all the time (deep beating throughout).
+    pub unison_mix: f32,
     /// Multiplier on the measured octave stretch (0 = equal temperament).
     pub stretch: f32,
     /// Multiplier on string inharmonicity B.
@@ -58,7 +71,9 @@ impl Tone {
         hardness: 0.0,
         tilt: 0.0,
         decay: 1.0,
-        detune: 1.6,
+        detune: 1.0,
+        strings: 0,
+        unison_mix: 0.0,
         stretch: 1.0,
         inharm: 1.0,
         hammer: 1.0,
@@ -101,7 +116,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             brightness: 0.95,
             tilt: -0.6,
             decay: 0.55,
-            detune: 2.6,
+            detune: 1.6,
             inharm: 2.2,
             stretch: 1.4,
             hammer: 1.6,
@@ -116,7 +131,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             brightness: 1.12,
             tilt: 0.8,
             decay: 0.65,
-            detune: 16.0,
+            detune: 10.0,
             inharm: 1.6,
             hammer: 1.4,
             gain: 1.12,
@@ -130,7 +145,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             hardness: -0.35,
             tilt: -4.0,
             decay: 0.8,
-            detune: 1.2,
+            detune: 0.75,
             hammer: 0.35,
             release: 1.6,
             vel_curve: 1.2,
@@ -145,11 +160,37 @@ pub enum StackKind {
     /// One carrier, envelope = A1 e^{-t/τ1} + A2 e^{-t/τ2}.
     #[default]
     Single,
-    /// Two detuned carriers (prompt/aftersound) sharing one modulator.
+    /// Two detuned carriers (prompt/aftersound of a string pair) sharing one
+    /// modulator.
     Dual,
     /// Two detuned carrier+modulator pairs (needed for the exact 1:1 stack,
-    /// otherwise the detuned copy would put a sideband near DC).
+    /// otherwise a detuned copy would put a sideband near DC).
     DualMod,
+    /// Prompt plus two aftersound carriers (string triple), one modulator.
+    Triple,
+    /// Three detuned carrier+modulator pairs (1:1 stack of a string triple).
+    TripleMod,
+}
+
+/// Strings per key on the recorded Yamaha C5.  `tools/analysis/unison.py`
+/// resolves the partials into their components: A0, C1 and D#1 have a single
+/// component (single strings) while F#1 and everything above show several
+/// within a cent or two.  Where pairs give way to triples cannot be told
+/// apart in the recordings, so the usual layout of a grand this size is used:
+/// single strings A0–E1, pairs F1–E2, triples from F2.
+pub fn unison_strings(key: u8) -> u8 {
+    match key {
+        0..=28 => 1,
+        29..=40 => 2,
+        _ => 3,
+    }
+}
+
+/// Measured frequency spread (cents) between the unison components of a
+/// partial: about 1 cent up to C5, rising to about 2.4 cents from F#6.
+pub fn unison_spread(key: f32) -> f32 {
+    let t = ((key - 72.0) / (90.0 - 72.0)).clamp(0.0, 1.0);
+    1.0 + 1.4 * t
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -274,8 +315,14 @@ pub struct KnockSpec {
 pub struct VoiceSpec {
     pub stacks: [StackSpec; MAX_STACKS],
     pub n: usize,
-    /// Frequency ratio of the second carrier copy.
-    pub detune_ratio: f64,
+    /// Strings sounding for this note (1..=3).
+    pub strings: u8,
+    /// Frequency ratios of the prompt carrier and the aftersound carrier(s).
+    pub unison: [f64; 3],
+    /// Share of the prompt (`[0]`) and aftersound (`[1]`) amplitude carried
+    /// by each of the (up to three) string copies; each row sums to 1 so the
+    /// copies add up to the fitted envelope while they are still in phase.
+    pub weights: [[f32; 2]; 3],
     /// Attack (hammer contact) time constant, seconds.
     pub attack: f32,
     /// Damper time constant after key release, seconds.
@@ -436,6 +483,37 @@ pub fn voice_spec_with(
     let bright = (tone.brightness * (1.0 + tone.hardness * (vnorm - 0.5))).max(0.0);
     let nyq = 0.45 * sr;
 
+    // unison strings: prompt carrier and aftersound carrier(s), placed so the
+    // spread between them is the measured unison spread (times the control)
+    let strings = if tone.strings == 0 {
+        unison_strings(key)
+    } else {
+        tone.strings.clamp(1, 3)
+    };
+    let spread = (unison_spread(kf) * tone.detune.max(0.0)) as f64;
+    let ratio = |cents: f64| 2f64.powf(cents / 1200.0);
+    let unison = match strings {
+        1 => [1.0, 1.0, 1.0],
+        2 => [ratio(-0.5 * spread), ratio(0.5 * spread), 1.0],
+        _ => [1.0, ratio(0.55 * spread), ratio(-0.45 * spread)],
+    };
+    // share of prompt / aftersound per string copy: blend from "prompt on
+    // string 1, aftersound mostly on string 2" (closest to the recordings in
+    // tools/analysis/compare.py) to "equal shares" (deepest beating)
+    let mix = tone.unison_mix.clamp(0.0, 1.0);
+    let (p0, q0, even): ([f32; 3], [f32; 3], [f32; 3]) = match strings {
+        1 => ([1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        2 => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.5, 0.0]),
+        _ => ([1.0, 0.0, 0.0], [0.0, 0.85, 0.15], [0.36, 0.34, 0.30]),
+    };
+    let mut weights = [[0.0f32; 2]; 3];
+    for k in 0..3 {
+        weights[k] = [
+            p0[k] + mix * (even[k] - p0[k]),
+            q0[k] + mix * (even[k] - q0[k]),
+        ];
+    }
+
     let mut stacks = [StackSpec::default(); MAX_STACKS];
     let mut n = 0;
     let (fit, nfit) = fitted(kf, layer);
@@ -462,10 +540,12 @@ pub fn voice_spec_with(
         let tilt = 10f32.powf(tone.tilt * (fc / f1).log2() as f32 / 20.0);
         let g = low_gain * tilt;
         stacks[n] = StackSpec {
-            kind: match c {
-                1 => StackKind::DualMod,
-                2..=4 => StackKind::Dual,
-                _ => StackKind::Single,
+            kind: match (strings, c) {
+                (1, _) | (_, 5..) => StackKind::Single,
+                (2, 1) => StackKind::DualMod,
+                (2, _) => StackKind::Dual,
+                (_, 1) => StackKind::TripleMod,
+                _ => StackKind::Triple,
             },
             fc,
             fm,
@@ -536,7 +616,9 @@ pub fn voice_spec_with(
     VoiceSpec {
         stacks,
         n,
-        detune_ratio: 2f64.powf(tone.detune as f64 / 1200.0),
+        strings,
+        unison,
+        weights,
         attack: 0.0006 + 0.0022 * (1.0 - kn),
         release: (0.035 + 0.22 * (1.0 - kn) * (1.0 - kn)) * tone.release,
         damped: key < 90,
@@ -555,6 +637,34 @@ mod tests {
         let (c, b) = tuning(69.0);
         assert!(c.abs() < 5.0, "A4 cents {c}");
         assert!(b > 1e-4 && b < 2e-3, "A4 B {b}");
+    }
+
+    #[test]
+    fn unison_layout() {
+        assert_eq!(unison_strings(21), 1); // A0
+        assert_eq!(unison_strings(28), 1); // E1
+        assert_eq!(unison_strings(29), 2); // F1
+        assert_eq!(unison_strings(40), 2); // E2
+        assert_eq!(unison_strings(41), 3); // F2
+        assert_eq!(unison_strings(108), 3);
+        let t = Tone::GRAND;
+        assert_eq!(voice_spec(21, 80.0, &t, 48000.0).strings, 1);
+        assert_eq!(voice_spec(33, 80.0, &t, 48000.0).strings, 2);
+        assert_eq!(voice_spec(60, 80.0, &t, 48000.0).strings, 3);
+        let forced = Tone { strings: 2, ..t };
+        assert_eq!(voice_spec(21, 80.0, &forced, 48000.0).strings, 2);
+        // single strings: no beating copies at all
+        let v = voice_spec(21, 80.0, &t, 48000.0);
+        assert!(v.stacks[..v.n].iter().all(|s| s.kind == StackKind::Single));
+        // triples: prompt + two aftersound carriers on the lowest stacks
+        let v = voice_spec(60, 80.0, &t, 48000.0);
+        assert_eq!(v.stacks[0].kind, StackKind::TripleMod);
+        assert_eq!(v.stacks[1].kind, StackKind::Triple);
+        let spread = 1200.0 * (v.unison[1] / v.unison[2]).log2();
+        assert!((spread - unison_spread(60.0) as f64).abs() < 1e-6);
+        // zero detune -> all copies in unison
+        let v = voice_spec(60, 80.0, &Tone { detune: 0.0, ..t }, 48000.0);
+        assert!(v.unison.iter().all(|&r| (r - 1.0).abs() < 1e-12));
     }
 
     #[test]
