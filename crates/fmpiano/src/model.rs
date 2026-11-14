@@ -27,7 +27,8 @@
 //! recordings (see `tools/fit`); they live in [`crate::tables`] for 30 keys ×
 //! 16 velocity layers and are interpolated here for any key and velocity.
 
-use crate::tables::{NoteFit, LAYERS, MAX_STACKS, NOTES};
+use crate::ideal::IdealParams;
+use crate::tables::{NoteFit, LAYERS, NOTES};
 
 /// Global tone controls; the presets are combinations of these.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,11 +84,46 @@ impl Tone {
     };
 }
 
-/// Built-in tones.  "Concert Grand" is the model as fitted to the recordings;
-/// the others are physically motivated variations of it.
-pub const PRESETS: [(&str, Tone); 6] = [
-    ("Concert Grand", Tone::GRAND),
-    (
+/// Which voice generator a preset uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// Stack envelopes fitted key by key to the recorded grand.
+    Fitted,
+    /// Smooth physical laws over the whole keyboard ([`crate::ideal`]).
+    Ideal,
+}
+
+pub struct Preset {
+    pub name: &'static str,
+    pub engine: Engine,
+    pub tone: Tone,
+    pub ideal: IdealParams,
+}
+
+const fn fitted_preset(name: &'static str, tone: Tone) -> Preset {
+    Preset {
+        name,
+        engine: Engine::Fitted,
+        tone,
+        ideal: IdealParams::DEFAULT,
+    }
+}
+
+const fn ideal_preset(name: &'static str, tone: Tone, ideal: IdealParams) -> Preset {
+    Preset {
+        name,
+        engine: Engine::Ideal,
+        tone,
+        ideal,
+    }
+}
+
+/// Built-in tones.  "Concert Grand" is the model as fitted to the recordings
+/// and the next five are physically motivated variations of it; the "Ideal"
+/// tones use the idealised engine.
+pub const PRESETS: [Preset; 11] = [
+    fitted_preset("Concert Grand", Tone::GRAND),
+    fitted_preset(
         "Bright Grand",
         Tone {
             brightness: 1.22,
@@ -98,7 +134,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             ..Tone::GRAND
         },
     ),
-    (
+    fitted_preset(
         "Mellow Grand",
         Tone {
             brightness: 0.78,
@@ -110,7 +146,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             ..Tone::GRAND
         },
     ),
-    (
+    fitted_preset(
         "Upright",
         Tone {
             brightness: 0.95,
@@ -125,7 +161,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             ..Tone::GRAND
         },
     ),
-    (
+    fitted_preset(
         "Honky-tonk",
         Tone {
             brightness: 1.12,
@@ -138,7 +174,7 @@ pub const PRESETS: [(&str, Tone); 6] = [
             ..Tone::GRAND
         },
     ),
-    (
+    fitted_preset(
         "Felt Piano",
         Tone {
             brightness: 0.5,
@@ -151,6 +187,83 @@ pub const PRESETS: [(&str, Tone); 6] = [
             vel_curve: 1.2,
             gain: 1.5,
             ..Tone::GRAND
+        },
+    ),
+    ideal_preset("Ideal Grand", Tone::GRAND, IdealParams::DEFAULT),
+    // a bigger instrument: longer, less stiff strings, a larger soundboard
+    // (stronger bass fundamentals) and a longer singing aftersound
+    ideal_preset(
+        "Ideal Concert Grand",
+        Tone {
+            inharm: 0.7,
+            decay: 1.25,
+            brightness: 1.05,
+            gain: 0.88,
+            ..Tone::GRAND
+        },
+        IdealParams {
+            strike: 1.0 / 8.0,
+            board: 0.7,
+            high_damp: 0.85,
+            aftersound: 1.4,
+            ..IdealParams::DEFAULT
+        },
+    ),
+    // hard hammers, shallow strike notches
+    ideal_preset(
+        "Ideal Bright Grand",
+        Tone {
+            brightness: 1.35,
+            hardness: 0.3,
+            tilt: 0.8,
+            hammer: 1.4,
+            gain: 0.83,
+            ..Tone::GRAND
+        },
+        IdealParams {
+            notch: 0.3,
+            ..IdealParams::DEFAULT
+        },
+    ),
+    // short, stiff strings, a small soundboard (thin bass), more string loss
+    ideal_preset(
+        "Ideal Upright",
+        Tone {
+            inharm: 2.2,
+            stretch: 1.3,
+            decay: 0.6,
+            detune: 1.6,
+            hammer: 1.5,
+            release: 0.8,
+            gain: 1.42,
+            ..Tone::GRAND
+        },
+        IdealParams {
+            strike: 1.0 / 9.0,
+            board: 1.8,
+            high_damp: 1.3,
+            notch: 0.6,
+            ..IdealParams::DEFAULT
+        },
+    ),
+    // soft felt between hammer and strings: dull, damped highs, small dynamics
+    ideal_preset(
+        "Ideal Felt",
+        Tone {
+            brightness: 0.45,
+            hardness: -0.4,
+            tilt: -3.0,
+            decay: 0.85,
+            hammer: 0.4,
+            vel_curve: 1.15,
+            gain: 1.6,
+            ..Tone::GRAND
+        },
+        IdealParams {
+            dynamics: 0.8,
+            notch: 0.2,
+            high_damp: 2.5,
+            ..IdealParams::DEFAULT
         },
     ),
 ];
@@ -206,6 +319,8 @@ pub struct StackSpec {
     pub i0: f32,
     pub iinf: f32,
     pub taui: f32,
+    /// Starting phase of the carrier(s), radians.
+    pub phase: f32,
 }
 
 /// A noisy FM pair: the modulator feeds back on itself (chaotic for
@@ -313,7 +428,7 @@ pub struct KnockSpec {
 
 #[derive(Clone, Copy, Debug)]
 pub struct VoiceSpec {
-    pub stacks: [StackSpec; MAX_STACKS],
+    pub stacks: [StackSpec; VOICE_STACKS],
     pub n: usize,
     /// Strings sounding for this note (1..=3).
     pub strings: u8,
@@ -409,19 +524,32 @@ fn layer_params(note: &NoteFit, layer: f32, s: usize) -> [f32; 7] {
     o
 }
 
-/// Interpolated fitted stacks for a key and velocity layer, as
-/// (centre partial, [A1, A2, τ1, τ2, I0, I∞, τI]) in ascending centre order.
-/// The two neighbouring recorded keys may use different stack layouts: stacks
-/// are matched by centre, and a stack present on one side only fades in/out.
-fn fitted(key: f32, layer: f32) -> ([(u8, [f32; 7]); MAX_STACKS], usize) {
+/// Most stacks a voice can have: the fitted tables use up to
+/// `tables::MAX_STACKS` per recorded key (two neighbouring keys can need more
+/// between them), the idealised engine up to 24.
+pub const VOICE_STACKS: usize = 24;
+
+/// Envelope of one stack before the tone controls are applied:
+/// centre partial `c` and `p` = [A1, A2, τ1, τ2, I0, I∞, τI].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StackEnv {
+    pub c: u8,
+    pub p: [f32; 7],
+}
+
+/// Interpolated fitted stacks for a key and velocity layer, in ascending
+/// centre order.  The two neighbouring recorded keys may use different stack
+/// layouts: stacks are matched by centre, and a stack present on one side
+/// only fades in/out.
+fn fitted(key: f32, layer: f32) -> ([StackEnv; VOICE_STACKS], usize) {
     let (i, w) = bracket(key);
     let (na, nb) = (&NOTES[i], &NOTES[i + 1]);
     let ca = &na.centers[..na.n_stacks as usize];
     let cb = &nb.centers[..nb.n_stacks as usize];
-    let mut out = [(0u8, [0.0f32; 7]); MAX_STACKS];
+    let mut out = [StackEnv::default(); VOICE_STACKS];
     let mut n = 0;
     let (mut ia, mut ib) = (0, 0);
-    while (ia < ca.len() || ib < cb.len()) && n < MAX_STACKS {
+    while (ia < ca.len() || ib < cb.len()) && n < VOICE_STACKS {
         let a = ca.get(ia).copied().unwrap_or(u8::MAX);
         let b = cb.get(ib).copied().unwrap_or(u8::MAX);
         let item = if a == b {
@@ -436,22 +564,22 @@ fn fitted(key: f32, layer: f32) -> ([(u8, [f32; 7]); MAX_STACKS], usize) {
             }
             ia += 1;
             ib += 1;
-            (a, o)
+            StackEnv { c: a, p: o }
         } else if a < b {
             let mut p = layer_params(na, layer, ia);
             p[0] *= 1.0 - w;
             p[1] *= 1.0 - w;
             ia += 1;
-            (a, p)
+            StackEnv { c: a, p }
         } else {
             let mut q = layer_params(nb, layer, ib);
             q[0] *= w;
             q[1] *= w;
             ib += 1;
-            (b, q)
+            StackEnv { c: b, p: q }
         };
         // drop stacks that are silent at this interpolation point
-        if item.1[0] + item.1[1] > 0.0 {
+        if item.p[0] + item.p[1] > 0.0 {
             out[n] = item;
             n += 1;
         }
@@ -459,7 +587,7 @@ fn fitted(key: f32, layer: f32) -> ([(u8, [f32; 7]); MAX_STACKS], usize) {
     (out, n)
 }
 
-/// Compute all parameters of a voice.
+/// Compute all parameters of a voice (fitted engine).
 pub fn voice_spec(key: u8, vel: f32, tone: &Tone, sample_rate: f32) -> VoiceSpec {
     voice_spec_with(key, vel, tone, &KnockModel::default(), sample_rate)
 }
@@ -473,7 +601,6 @@ pub fn voice_spec_with(
     sample_rate: f32,
 ) -> VoiceSpec {
     let kf = key as f32;
-    let sr = sample_rate as f64;
     let (cents, b0) = tuning(kf);
     let b = (b0 * tone.inharm) as f64;
     let f1 = 440.0 * 2f64.powf((kf as f64 - 69.0) / 12.0 + (cents * tone.stretch) as f64 / 1200.0);
@@ -481,6 +608,59 @@ pub fn voice_spec_with(
     let (layer, low_gain) = velocity_layer(vel, tone);
     let vnorm = layer / (LAYERS as f32 - 1.0); // 0..1
     let bright = (tone.brightness * (1.0 + tone.hardness * (vnorm - 0.5))).max(0.0);
+    let (envs, n) = fitted(kf, layer);
+    let shape = VoiceShape {
+        f0,
+        b,
+        f1,
+        vnorm,
+        stack_gain: low_gain,
+        knock_db: 20.0 * low_gain.log10(),
+        index_scale: bright,
+        spread_phases: false,
+    };
+    assemble(key, tone, km, sample_rate, &shape, &envs[..n])
+}
+
+/// Pitch, dynamics and scaling handed from an engine to [`assemble`].
+const GOLDEN_ANGLE: f32 = 2.399_963;
+
+pub struct VoiceShape {
+    /// String fundamental (without inharmonic stretch) and inharmonicity.
+    pub f0: f64,
+    pub b: f64,
+    /// Frequency of partial 1.
+    pub f1: f64,
+    /// Velocity on the 0..1 scale of the recorded layers (for the knock).
+    pub vnorm: f32,
+    /// Extra gain on all stacks, and on the knock in dB.
+    pub stack_gain: f32,
+    pub knock_db: f32,
+    /// Multiplier on every modulation index.
+    pub index_scale: f32,
+    /// Start the stacks' carriers at golden-angle phases instead of all at 0.
+    /// Neighbouring stacks put sidebands on the same partials; with equal
+    /// phases a lower sideband (J_-1 = -J_1) cancels the upper sideband of the
+    /// stack below at the attack, while spread phases make their powers add,
+    /// as the idealised engine's moment matching assumes.
+    pub spread_phases: bool,
+}
+
+/// Final stage shared by both engines: turns stack envelopes into carrier and
+/// modulator frequencies, applies the tone controls (tilt, sustain, unison
+/// strings) and adds hammer noise, dampers and panning.
+pub fn assemble(
+    key: u8,
+    tone: &Tone,
+    km: &KnockModel,
+    sample_rate: f32,
+    sh: &VoiceShape,
+    envs: &[StackEnv],
+) -> VoiceSpec {
+    let kf = key as f32;
+    let sr = sample_rate as f64;
+    let (f0, b, f1) = (sh.f0, sh.b, sh.f1);
+    let vnorm = sh.vnorm;
     let nyq = 0.45 * sr;
 
     // unison strings: prompt carrier and aftersound carrier(s), placed so the
@@ -514,10 +694,10 @@ pub fn voice_spec_with(
         ];
     }
 
-    let mut stacks = [StackSpec::default(); MAX_STACKS];
+    let mut stacks = [StackSpec::default(); VOICE_STACKS];
     let mut n = 0;
-    let (fit, nfit) = fitted(kf, layer);
-    for &(c, p) in &fit[..nfit] {
+    for e in envs.iter().take(VOICE_STACKS) {
+        let (c, p) = (e.c, e.p);
         let cf = c as f64;
         let fc = partial(cf, f0, b);
         let fm = if c == 1 {
@@ -529,8 +709,8 @@ pub fn voice_spec_with(
             break;
         }
         let cap = index_cap(c) * 1.25;
-        let mut i0 = (p[4] * bright).min(cap);
-        let mut iinf = (p[5] * bright).min(cap);
+        let mut i0 = (p[4] * sh.index_scale).min(cap);
+        let mut iinf = (p[5] * sh.index_scale).min(cap);
         // keep the significant sidebands (|j| <= I + 2) below Nyquist
         let room = ((nyq - fc) / fm - 2.0).max(0.0) as f32;
         i0 = i0.min(room);
@@ -538,7 +718,7 @@ pub fn voice_spec_with(
         // tilt pivots on the fundamental: it reshapes the spectrum without
         // changing the level of partial 1
         let tilt = 10f32.powf(tone.tilt * (fc / f1).log2() as f32 / 20.0);
-        let g = low_gain * tilt;
+        let g = sh.stack_gain * tilt;
         stacks[n] = StackSpec {
             kind: match (strings, c) {
                 (1, _) | (_, 5..) => StackKind::Single,
@@ -556,13 +736,18 @@ pub fn voice_spec_with(
             i0,
             iinf,
             taui: p[6] * tone.decay,
+            phase: if sh.spread_phases {
+                n as f32 * GOLDEN_ANGLE
+            } else {
+                0.0
+            },
         };
         n += 1;
     }
 
     // hammer knock (absolute levels, see KnockModel)
     let kn = (kf - 21.0) / 87.0; // 0 (A0) .. 1 (C8)
-    let vel_db = 20.0 * low_gain.log10();
+    let vel_db = sh.knock_db;
     let thump_db =
         km.thump_db - km.thump_key_db * (1.0 - kn) + km.thump_vel_db * (vnorm - 1.0) + vel_db;
     let click_db =

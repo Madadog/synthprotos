@@ -109,10 +109,18 @@ pub extern "C" fn fmp_preset_count() -> u32 {
 pub extern "C" fn fmp_preset_name(idx: u32) -> *const u8 {
     PRESETS
         .get(idx as usize)
-        .map_or(core::ptr::null(), |p| p.0.as_ptr())
+        .map_or(core::ptr::null(), |p| p.name.as_ptr())
 }
 
 #[no_mangle]
 pub extern "C" fn fmp_preset_name_len(idx: u32) -> u32 {
-    PRESETS.get(idx as usize).map_or(0, |p| p.0.len() as u32)
+    PRESETS.get(idx as usize).map_or(0, |p| p.name.len() as u32)
+}
+
+/// 0 = fitted engine, 1 = idealised engine.
+#[no_mangle]
+pub extern "C" fn fmp_preset_engine(idx: u32) -> u32 {
+    PRESETS
+        .get(idx as usize)
+        .map_or(0, |p| (p.engine == fmpiano::model::Engine::Ideal) as u32)
 }

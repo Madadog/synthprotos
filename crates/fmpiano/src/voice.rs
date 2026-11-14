@@ -1,8 +1,7 @@
 //! One sounding note: a set of FM stacks plus the hammer knock.
 
-use crate::model::{KnockSpec, NoiseFm, StackKind, StackSpec, VoiceSpec};
+use crate::model::{KnockSpec, NoiseFm, StackKind, StackSpec, VoiceSpec, VOICE_STACKS};
 use crate::sine::{phase_inc, rad_to_phase, SineTable};
-use crate::tables::MAX_STACKS;
 
 #[inline]
 fn decay_coef(tau: f32, sr: f32) -> f32 {
@@ -52,6 +51,8 @@ impl StackState {
         let single = s.kind == StackKind::Single;
         let u = if single { [1.0; 3] } else { *unison };
         let fm = |k: usize| if own_mod { s.fm * u[k] } else { s.fm };
+        // unison copies start in phase, like strings struck by one hammer
+        let pc = rad_to_phase(s.phase);
         StackState {
             kind: s.kind,
             pm1: 0,
@@ -60,11 +61,11 @@ impl StackState {
             dm2: phase_inc(fm(1), srd),
             pm3: 0,
             dm3: phase_inc(fm(2), srd),
-            pc1: 0,
+            pc1: pc,
             dc1: phase_inc(s.fc * u[0], srd),
-            pc2: 0,
+            pc2: pc,
             dc2: phase_inc(s.fc * u[1], srd),
-            pc3: 0,
+            pc3: pc,
             dc3: phase_inc(s.fc * u[2], srd),
             a1: s.a1,
             k1: decay_coef(s.tau1, sr),
@@ -326,7 +327,7 @@ pub struct Voice {
     pub releasing: bool,
     /// note-on order, used for voice stealing
     pub serial: u64,
-    stacks: [StackState; MAX_STACKS],
+    stacks: [StackState; VOICE_STACKS],
     n: usize,
     knock: KnockState,
     att: f32,
@@ -351,7 +352,7 @@ impl Voice {
             key_down: false,
             releasing: false,
             serial: 0,
-            stacks: [StackState::default(); MAX_STACKS],
+            stacks: [StackState::default(); VOICE_STACKS],
             n: 0,
             knock: KnockState::default(),
             att: 0.0,

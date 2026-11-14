@@ -4,33 +4,52 @@
 const P = {
   VOLUME: 0, REVERB: 1, BRIGHTNESS: 2, HARDNESS: 3, TILT: 4, DECAY: 5, DETUNE: 6,
   STRETCH: 7, INHARM: 8, HAMMER: 9, RELEASE: 10, VEL_CURVE: 11, WIDTH: 12,
-  STRINGS: 13, UNISON_MIX: 14, COUNT: 15,
+  STRINGS: 13, UNISON_MIX: 14, ENGINE: 15, STRIKE: 16, NOTCH: 17, BOARD: 18,
+  HIGH_DAMP: 19, DYNAMICS: 20, AFTERSOUND: 21, COUNT: 22,
 };
+const ENGINE_FITTED = 0, ENGINE_IDEAL = 1;
+const DEFAULT_PRESET = 'Ideal Grand';
 
-// tone controls: sliders [param, label, min, max, step, hint, format] or
-// selects [param, label, [[value, text], ...], hint]
+// Tone controls.  Sliders: {id, label, min, max, step, hint, fmt, log}; with
+// log: true the slider moves the logarithm of the value (for multipliers).
+// Selects: {id, label, options: [[value, text], ...], hint}.
 const UNISON_C4_CENTS = 1.0; // measured unison spread around middle C
+const times = (v) => `×${v.toFixed(2)}`;
+const IDEAL_SLIDERS = [
+  { id: P.STRIKE, label: 'Strike point', min: 0.05, max: 0.25, step: 0.001, log: true,
+    hint: 'where the hammer hits the string; partials near multiples of 1/strike go missing', fmt: (v) => `1/${(1 / v).toFixed(1)} of the string` },
+  { id: P.NOTCH, label: 'Strike notches', min: 0, max: 1, step: 0.01,
+    hint: 'depth of those gaps: 0 = none, 0.5 = as on the recorded grand, 1 = deep', fmt: (v) => v.toFixed(2) },
+  { id: P.BOARD, label: 'Soundboard low corner', min: 0.3, max: 4, step: 0.01, log: true,
+    hint: 'higher = thinner bass fundamentals, as on a smaller instrument', fmt: times },
+  { id: P.HIGH_DAMP, label: 'High-partial damping', min: 0.2, max: 5, step: 0.01, log: true,
+    hint: 'how fast the upper partials die away (string losses)', fmt: times },
+  { id: P.AFTERSOUND, label: 'Aftersound', min: 0.05, max: 10, step: 0.01, log: true,
+    hint: 'level of the slow second stage of the decay: higher notes sing on longer', fmt: times },
+  { id: P.DYNAMICS, label: 'Dynamic range', min: 0.3, max: 2, step: 0.01,
+    hint: 'loudness difference between soft and hard strikes', fmt: times },
+];
 const SLIDERS = [
-  [P.BRIGHTNESS, 'Brightness', 0.3, 2.0, 0.01, 'scales every FM modulation index', (v) => `×${v.toFixed(2)}`],
-  [P.HARDNESS, 'Hammer hardness', -1, 1, 0.01, 'extra brightness for hard strikes', (v) => v.toFixed(2)],
-  [P.TILT, 'Spectral tilt', -8, 6, 0.1, 'dB per octave above the fundamental', (v) => `${v.toFixed(1)} dB/oct`],
-  [P.DECAY, 'Sustain length', 0.2, 3, 0.01, 'scales all decay times', (v) => `×${v.toFixed(2)}`],
-  [P.DETUNE, 'Unison detune (beating speed)', 0, 10, 0.05,
-    '× the detuning measured between each note\'s strings: ≈1 ¢ up to C5, 2.4 ¢ in the top octaves; 0 = perfectly tuned',
-    (v) => `×${v.toFixed(2)} · ${(v * UNISON_C4_CENTS).toFixed(1)} ¢ at C4`],
-  [P.UNISON_MIX, 'Unison balance (beating depth)', 0, 1, 0.01,
-    '0 = as recorded: prompt sound on one string, aftersound on the others; 1 = equal shares, deep beating throughout',
-    (v) => v.toFixed(2)],
-  [P.STRINGS, 'Strings per note', [[0, 'As on the recorded grand: 1 · 2 · 3'], [1, '1 string (no unison)'], [2, '2 strings'], [3, '3 strings']],
-    'grand: single strings A0–E1, pairs F1–E2, triples from F2'],
-  [P.INHARM, 'String stiffness', 0, 5, 0.01, 'inharmonicity B (×measured)', (v) => `×${v.toFixed(2)}`],
-  [P.STRETCH, 'Octave stretch', 0, 2, 0.01, '0 = equal temperament', (v) => `×${v.toFixed(2)}`],
-  [P.HAMMER, 'Hammer noise', 0, 3, 0.01, 'level of the FM knock burst', (v) => `×${v.toFixed(2)}`],
-  [P.RELEASE, 'Damper release', 0.2, 4, 0.01, 'time for dampers to stop a note', (v) => `×${v.toFixed(2)}`],
-  [P.VEL_CURVE, 'Velocity curve', 0.5, 2, 0.01, '<1 plays louder, >1 softer', (v) => v.toFixed(2)],
-  [P.REVERB, 'Room', 0, 1, 0.01, 'reverb amount', (v) => `${Math.round(v * 100)}%`],
-  [P.WIDTH, 'Stereo width', 0, 2, 0.01, 'key panning', (v) => `${Math.round(v * 100)}%`],
-  [P.VOLUME, 'Volume', 0, 1.5, 0.01, '', (v) => `${Math.round(v * 100)}%`],
+  { id: P.BRIGHTNESS, label: 'Brightness', min: 0.3, max: 2.0, step: 0.01, log: true,
+    hint: 'harder, brighter tone (FM index, or the hammer contact time)', fmt: times },
+  { id: P.HARDNESS, label: 'Hammer hardness', min: -1, max: 1, step: 0.01, hint: 'extra brightness for hard strikes', fmt: (v) => v.toFixed(2) },
+  { id: P.TILT, label: 'Spectral tilt', min: -8, max: 6, step: 0.1, hint: 'dB per octave above the fundamental', fmt: (v) => `${v.toFixed(1)} dB/oct` },
+  { id: P.DECAY, label: 'Sustain length', min: 0.2, max: 3, step: 0.01, log: true, hint: 'scales all decay times', fmt: times },
+  { id: P.DETUNE, label: 'Unison detune (beating speed)', min: 0, max: 10, step: 0.05,
+    hint: '× the detuning measured between each note\'s strings: ≈1 ¢ up to C5, 2.4 ¢ in the top octaves; 0 = perfectly tuned',
+    fmt: (v) => `×${v.toFixed(2)} · ${(v * UNISON_C4_CENTS).toFixed(1)} ¢ at C4` },
+  { id: P.UNISON_MIX, label: 'Unison balance (beating depth)', min: 0, max: 1, step: 0.01,
+    hint: '0 = as recorded: prompt sound on one string, aftersound on the others; 1 = equal shares, deep beating throughout', fmt: (v) => v.toFixed(2) },
+  { id: P.STRINGS, label: 'Strings per note', options: [[0, 'As on a grand: 1 · 2 · 3'], [1, '1 string (no unison)'], [2, '2 strings'], [3, '3 strings']],
+    hint: 'grand: single strings A0–E1, pairs F1–E2, triples from F2' },
+  { id: P.INHARM, label: 'String stiffness', min: 0, max: 5, step: 0.01, hint: 'inharmonicity B (× the measured curve)', fmt: times },
+  { id: P.STRETCH, label: 'Octave stretch', min: 0, max: 2, step: 0.01, hint: '0 = equal temperament', fmt: times },
+  { id: P.HAMMER, label: 'Hammer noise', min: 0, max: 3, step: 0.01, hint: 'level of the FM knock burst', fmt: times },
+  { id: P.RELEASE, label: 'Damper release', min: 0.2, max: 4, step: 0.01, log: true, hint: 'time for dampers to stop a note', fmt: times },
+  { id: P.VEL_CURVE, label: 'Velocity curve', min: 0.5, max: 2, step: 0.01, hint: '<1 plays louder, >1 softer', fmt: (v) => v.toFixed(2) },
+  { id: P.REVERB, label: 'Room', min: 0, max: 1, step: 0.01, hint: 'reverb amount', fmt: (v) => `${Math.round(v * 100)}%` },
+  { id: P.WIDTH, label: 'Stereo width', min: 0, max: 2, step: 0.01, hint: 'key panning', fmt: (v) => `${Math.round(v * 100)}%` },
+  { id: P.VOLUME, label: 'Volume', min: 0, max: 1.5, step: 0.01, hint: '', fmt: (v) => `${Math.round(v * 100)}%` },
 ];
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -69,6 +88,8 @@ function presetNames() {
   }
   return names;
 }
+
+const presetEngine = (i) => (ui.fmp_preset_engine ? ui.fmp_preset_engine(i) : ENGINE_FITTED);
 
 const send = (m) => { if (node) node.port.postMessage(m); };
 
@@ -256,8 +277,14 @@ function initComputerKeys() {
 const midiState = { access: null, count: 0, lines: [] };
 const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+function midiChip(text, state) {
+  const chip = $('midi-chip');
+  chip.textContent = `MIDI: ${text}`;
+  chip.dataset.state = state;
+}
+
 function midiLog(text) {
-  const t = (performance.now() / 1000).toFixed(3).padStart(8);
+  const t = (performance.now() / 1000).toFixed(2).padStart(7);
   midiState.lines.push(`${t}  ${text}`);
   if (midiState.lines.length > 300) midiState.lines.shift();
   const el = $('midi-log');
@@ -290,8 +317,9 @@ function onMidiMessage(ev) {
   const chSel = Number($('midi-channel').value);
   const used = st < 0xf0 && (chSel < 0 || chSel === (st & 0x0f));
   const hex = Array.from(d.slice(0, 3), (x) => x.toString(16).padStart(2, '0')).join(' ');
-  const port = (ev.target && ev.target.name) || 'input';
-  midiLog(`${port.slice(0, 22).padEnd(22)}  ${hex.padEnd(8)}  ${describeMidi(d)}${used || st >= 0xf0 ? '' : '   (other channel, ignored)'}`);
+  const many = midiState.access && midiState.access.inputs.size > 1;
+  const port = many ? `[${((ev.target && ev.target.name) || 'input').slice(0, 16)}] ` : '';
+  midiLog(`${hex.padEnd(8)}  ${port}${describeMidi(d)}${used || st >= 0xf0 ? '' : ' (other channel, ignored)'}`);
   if (!used) return;
   const [, a, b] = d;
   const cmd = st & 0xf0;
@@ -312,13 +340,15 @@ function refreshMidiDevices() {
         port.onmidimessage = onMidiMessage;
         if (port.open) port.open().catch((e) => midiLog(`could not open "${port.name}": ${e.name}: ${e.message}`));
       }
-      rows.push(`<tr><td>${port.type}</td><td>${esc(port.name || '?')}</td><td>${esc(port.manufacturer || '')}</td><td>${port.state}</td><td>${port.connection}</td></tr>`);
+      const maker = port.manufacturer ? ` · ${esc(port.manufacturer)}` : '';
+      rows.push(`<li><b>${esc(port.name || '?')}</b><span class="muted">${port.type}${maker} · ${port.state} · ${port.connection}</span></li>`);
     }
   }
   $('midi-devices').innerHTML = rows.length ? rows.join('')
-    : `<tr><td colspan="5">${acc ? 'Access granted, but the browser reports no MIDI devices. Plug one in (the list updates by itself) or check the notes below.' : 'Not connected yet: press “Connect MIDI device”.'}</td></tr>`;
+    : `<li class="muted">${acc ? 'Access granted, but the browser reports no MIDI devices. Plug one in (the list updates by itself) or check the notes below.' : 'Not connected yet: press “Connect”.'}</li>`;
   const n = acc ? acc.inputs.size : 0;
   $('midi-summary').textContent = acc ? `${n} input${n === 1 ? '' : 's'}` : 'not connected';
+  if (acc) midiChip(`${n} input${n === 1 ? '' : 's'}`, n ? 'on' : 'empty');
 }
 
 async function queryMidiPermission() {
@@ -341,6 +371,7 @@ async function queryMidiPermission() {
 function midiFail(e) {
   const name = (e && e.name) || 'Error';
   $('midi-access').textContent = `refused: ${name}`;
+  midiChip('refused', 'error');
   midiLog(`requestMIDIAccess failed: ${name}: ${(e && e.message) || e}`);
   const hints = {
     SecurityError: 'Permission was refused. In Firefox this is what happens when the "site permission add-on" prompt is dismissed, blocked, or not available (e.g. in a private window). See "If it does not work" below, then press Connect again.',
@@ -363,6 +394,7 @@ function connectMidi(fromClick) {
   const sysex = $('midi-sysex').checked;
   midiLog(`requesting MIDI access${sysex ? ' (with SysEx)' : ''}…`);
   $('midi-access').textContent = 'waiting for the browser (look for a prompt near the address bar)';
+  midiChip('asking…', 'wait');
   let req;
   try {
     req = navigator.requestMIDIAccess({ sysex });
@@ -391,67 +423,75 @@ async function initMidiPanel() {
   $('midi-api').textContent = hasApi ? 'available' : (/safari/i.test(ua) && !/chrome|chromium|android/i.test(ua) ? 'not available: Safari does not implement Web MIDI' : 'not available in this browser');
   $('midi-secure').textContent = window.isSecureContext ? 'yes' : 'no: Web MIDI only works on https:// pages (or localhost)';
   $('midi-browser').textContent = ua;
-  if (firefox) $('midi-help-firefox').open = true;
+
   const ch = $('midi-channel');
   for (let i = 0; i < 16; i++) ch.insertAdjacentHTML('beforeend', `<option value="${i}">${i + 1}</option>`);
   $('midi-connect').disabled = !hasApi;
+  if (!hasApi) midiChip('unsupported', 'error');
   $('midi-connect').addEventListener('click', () => connectMidi(true));
   $('midi-clear').addEventListener('click', () => { midiState.lines = []; midiState.count = 0; $('midi-log').textContent = ''; $('midi-count').textContent = ''; });
   $('midi-sysex').addEventListener('change', queryMidiPermission);
   refreshMidiDevices();
   if (!hasApi) return;
   const state = await queryMidiPermission();
+  // Firefox users usually need the add-on notes until access works once
+  if (firefox && state !== 'granted') $('midi-help-firefox').open = true;
   if (state === 'granted') {
     midiLog('MIDI permission was granted before: connecting without a prompt.');
     connectMidi(false);
   } else {
-    midiLog('Press "Connect MIDI device" to ask the browser for access.');
+    midiLog('Press "Connect" to ask the browser for access.');
   }
 }
 
 // ------------------------------------------------------------------ tone UI
 const sliderEls = {};
-function buildSliders() {
-  const box = $('sliders');
-  for (const def of SLIDERS) {
-    if (Array.isArray(def[2])) {
-      const [id, label, options, hint] = def;
-      const wrap = document.createElement('label');
-      wrap.className = 'slider';
-      wrap.innerHTML = `<span>${label}</span><output></output><select>${options.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select><small>${hint}</small>`;
+function setParam(id, v) {
+  ui.fmp_set_param(uiEngine, id, v);
+  send({ t: 'param', id, v });
+}
+
+function buildSliders(box, defs) {
+  for (const d of defs) {
+    const wrap = document.createElement('label');
+    wrap.className = 'slider';
+    if (d.options) {
+      wrap.innerHTML = `<span>${d.label}</span><output></output><select>${d.options.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select><small>${d.hint}</small>`;
       const sel = wrap.querySelector('select');
-      sel.addEventListener('change', () => {
-        const v = Number(sel.value);
-        ui.fmp_set_param(uiEngine, id, v);
-        send({ t: 'param', id, v });
-      });
-      sliderEls[id] = { input: sel, out: wrap.querySelector('output'), fmt: () => '' };
+      sel.addEventListener('change', () => setParam(d.id, Number(sel.value)));
+      sliderEls[d.id] = { set: (v) => { sel.value = v; } };
       box.appendChild(wrap);
       continue;
     }
-    const [id, label, min, max, step, hint, fmt] = def;
-    const wrap = document.createElement('label');
-    wrap.className = 'slider';
-    wrap.innerHTML = `<span>${label}</span><output></output><input type="range" min="${min}" max="${max}" step="${step}">${hint ? `<small>${hint}</small>` : ''}`;
+    const lo = d.log ? Math.log(d.min) : d.min, hi = d.log ? Math.log(d.max) : d.max;
+    const step = d.log ? (hi - lo) / 400 : d.step;
+    wrap.innerHTML = `<span>${d.label}</span><output></output><input type="range" min="${lo}" max="${hi}" step="${step}">${d.hint ? `<small>${d.hint}</small>` : ''}`;
     const input = wrap.querySelector('input');
     const out = wrap.querySelector('output');
+    const value = () => (d.log ? Math.exp(Number(input.value)) : Number(input.value));
     input.addEventListener('input', () => {
-      const v = Number(input.value);
-      out.textContent = fmt(v);
-      ui.fmp_set_param(uiEngine, id, v);
-      send({ t: 'param', id, v });
+      const v = value();
+      out.textContent = d.fmt(v);
+      setParam(d.id, v);
     });
-    sliderEls[id] = { input, out, fmt };
+    sliderEls[d.id] = {
+      set: (v) => {
+        input.value = d.log ? Math.log(Math.max(v, 1e-6)) : v;
+        out.textContent = d.fmt(v);
+      },
+    };
     box.appendChild(wrap);
   }
 }
 
+function showEngine(engine) {
+  for (const r of document.querySelectorAll('input[name=engine]')) r.checked = Number(r.value) === engine;
+  $('sliders-ideal').hidden = engine !== ENGINE_IDEAL;
+}
+
 function refreshSliders() {
-  for (const [id, s] of Object.entries(sliderEls)) {
-    const v = ui.fmp_get_param(uiEngine, Number(id));
-    s.input.value = v;
-    s.out.textContent = s.fmt(v);
-  }
+  for (const [id, s] of Object.entries(sliderEls)) s.set(ui.fmp_get_param(uiEngine, Number(id)));
+  showEngine(Math.round(ui.fmp_get_param(uiEngine, P.ENGINE)));
 }
 
 function applyPreset(i) {
@@ -462,6 +502,35 @@ function applyPreset(i) {
   send({ t: 'preset', i });
   for (const [id, v] of keep) send({ t: 'param', id, v });
   refreshSliders();
+}
+
+function initEngineSwitch() {
+  for (const r of document.querySelectorAll('input[name=engine]')) {
+    r.addEventListener('change', () => {
+      if (!r.checked) return;
+      setParam(P.ENGINE, Number(r.value));
+      showEngine(Number(r.value));
+    });
+  }
+}
+
+function fillPresets(sel) {
+  const names = presetNames();
+  const groups = [[ENGINE_IDEAL, 'Idealised piano'], [ENGINE_FITTED, 'Fitted to the recording']];
+  for (const [engine, label] of groups) {
+    const g = document.createElement('optgroup');
+    g.label = label;
+    names.forEach((name, i) => {
+      if (presetEngine(i) !== engine) return;
+      const o = document.createElement('option');
+      o.value = i;
+      o.textContent = name;
+      g.appendChild(o);
+    });
+    if (g.children.length) sel.appendChild(g);
+  }
+  const def = names.indexOf(DEFAULT_PRESET);
+  sel.value = String(def >= 0 ? def : 0);
 }
 
 // ------------------------------------------------------------------ spectrum
@@ -499,10 +568,10 @@ function drawScope() {
 let abSources = [];
 const sampleCache = new Map();
 
-function renderFm(key, layer, secs) {
+function renderFm(key, layer, secs, preset) {
   const sr = ctx.sampleRate;
   const e = ui.fmp_new(sr);
-  ui.fmp_set_preset(e, 0);
+  ui.fmp_set_preset(e, preset);
   ui.fmp_set_param(e, P.REVERB, 0);
   ui.fmp_set_param(e, P.WIDTH, 0);
   ui.fmp_set_param(e, P.VOLUME, UNITY_VOLUME);
@@ -558,12 +627,13 @@ async function ab(which) {
   await startAudio();
   stopAb();
   const key = Number($('ab-note').value), layer = Number($('ab-dyn').value);
+  const preset = Number($('ab-engine').value || 0);
   const t0 = ctx.currentTime + 0.05;
-  if (which === 'fm') playBuffer(renderFm(key, layer, 6), t0);
+  if (which === 'fm') playBuffer(renderFm(key, layer, 6, preset), t0);
   else if (which === 'ref') playBuffer(await loadSample(key, layer), t0);
   else {
     const ref = await loadSample(key, layer);
-    const end = playBuffer(renderFm(key, layer, 6), ctx.currentTime + 0.05);
+    const end = playBuffer(renderFm(key, layer, 6, preset), ctx.currentTime + 0.05);
     playBuffer(ref, end + 0.5);
   }
 }
@@ -572,7 +642,9 @@ async function ab(which) {
 async function main() {
   buildKeyboard();
   initComputerKeys();
-  buildSliders();
+  buildSliders($('sliders-ideal'), IDEAL_SLIDERS);
+  buildSliders($('sliders'), SLIDERS);
+  initEngineSwitch();
   initMidiPanel();
   const vel = $('velocity');
   vel.addEventListener('input', () => { $('velout').textContent = vel.value; });
@@ -596,16 +668,15 @@ async function main() {
     return;
   }
   const sel = $('preset');
-  presetNames().forEach((name, i) => {
-    const o = document.createElement('option');
-    o.value = i;
-    o.textContent = name;
-    sel.appendChild(o);
-  });
+  fillPresets(sel);
   sel.disabled = false;
   sel.addEventListener('change', () => applyPreset(Number(sel.value)));
   $('reset').addEventListener('click', () => applyPreset(Number(sel.value)));
-  refreshSliders();
+  applyPreset(Number(sel.value));
+  const abSel = $('ab-engine');
+  presetNames().forEach((name, i) => {
+    if (name === 'Concert Grand' || name === DEFAULT_PRESET) abSel.insertAdjacentHTML('beforeend', `<option value="${i}">${name}</option>`);
+  });
   const power = $('power');
   power.disabled = false;
   power.textContent = '▶ Start audio';

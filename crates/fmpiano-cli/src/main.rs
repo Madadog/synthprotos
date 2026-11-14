@@ -4,6 +4,8 @@
 //!   fmpiano refset --outdir DIR [--dur 10]     # the 30 Salamander keys x 16 layers, dry mono
 //!   fmpiano demo   -o demo.wav [--preset N]
 //!   fmpiano bench
+//!   fmpiano spec   --key 60 --vel 100 [--preset N]  # print the voice parameters
+//!   fmpiano presets                                # list the built-in presets
 //!
 //! Every command accepts --preset N and --param ID=VALUE[,ID=VALUE...] (ids in
 //! `fmpiano::param`, e.g. 6 = unison detune, 13 = strings per note).
@@ -255,6 +257,7 @@ fn main() {
         }
         "bench" => {
             let mut s = Synth::new(SR);
+            s.set_preset(a.num("--preset", 0.0) as usize);
             let secs = 10.0;
             let n = (secs * SR) as usize;
             let (mut l, mut r) = (vec![0.0f32; 128], vec![0.0f32; 128]);
@@ -281,15 +284,31 @@ fn main() {
         "spec" => {
             let key = a.num("--key", 60.0) as u8;
             let vel = a.num("--vel", 100.0);
-            let v = model::voice_spec(key, vel, &PRESETS[a.num("--preset", 0.0) as usize].1, SR);
+            let pr = &PRESETS[a.num("--preset", 0.0) as usize];
+            let v = match pr.engine {
+                model::Engine::Fitted => model::voice_spec(key, vel, &pr.tone, SR),
+                model::Engine::Ideal => fmpiano::ideal::ideal_voice_spec(
+                    key,
+                    vel,
+                    &pr.tone,
+                    &pr.ideal,
+                    &model::KnockModel::default(),
+                    SR,
+                ),
+            };
             println!("f1 = {:.3} Hz, {} stacks", v.f1, v.n);
             for s in &v.stacks[..v.n] {
                 println!("{s:?}");
             }
             println!("{:?}", v.knock);
         }
+        "presets" => {
+            for p in &PRESETS {
+                println!("{}", p.name);
+            }
+        }
         _ => {
-            eprintln!("usage: fmpiano note|refset|demo|bench|spec [options]");
+            eprintln!("usage: fmpiano note|refset|demo|bench|spec|presets [options]");
             std::process::exit(2);
         }
     }

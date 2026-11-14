@@ -1,6 +1,7 @@
 //! Polyphonic engine: voice allocation, sustain pedal, mixing and effects.
 
-use crate::model::{voice_spec_with, KnockModel, Tone, PRESETS};
+use crate::ideal::{ideal_voice_spec, IdealParams};
+use crate::model::{voice_spec_with, Engine, KnockModel, Tone, PRESETS};
 use crate::reverb::Reverb;
 use crate::sine::SineTable;
 use crate::voice::Voice;
@@ -27,7 +28,21 @@ pub mod param {
     pub const STRINGS: u32 = 13;
     /// Share of the sound between unison strings (beating depth), 0..1.
     pub const UNISON_MIX: u32 = 14;
-    pub const COUNT: u32 = 15;
+    /// Voice generator: 0 = fitted to the recordings, 1 = idealised piano.
+    pub const ENGINE: u32 = 15;
+    /// Idealised piano: strike point (fraction of the string).
+    pub const STRIKE: u32 = 16;
+    /// Idealised piano: depth of the strike-point notches, 0..1.
+    pub const NOTCH: u32 = 17;
+    /// Idealised piano: soundboard low corner multiplier (bass fundamentals).
+    pub const BOARD: u32 = 18;
+    /// Idealised piano: damping of high partials multiplier.
+    pub const HIGH_DAMP: u32 = 19;
+    /// Idealised piano: velocity-to-level range multiplier.
+    pub const DYNAMICS: u32 = 20;
+    /// Idealised piano: aftersound (slow decay stage) odds multiplier.
+    pub const AFTERSOUND: u32 = 21;
+    pub const COUNT: u32 = 22;
 }
 
 struct DcBlock {
@@ -64,6 +79,8 @@ pub struct Synth {
     voices: Vec<Voice>,
     serial: u64,
     tone: Tone,
+    engine: Engine,
+    ideal: IdealParams,
     knock: KnockModel,
     preset: usize,
     sustain: bool,
@@ -91,7 +108,9 @@ impl Synth {
                 .map(|_| Voice::idle(sample_rate))
                 .collect(),
             serial: 0,
-            tone: PRESETS[0].1,
+            tone: PRESETS[0].tone,
+            engine: PRESETS[0].engine,
+            ideal: PRESETS[0].ideal,
             knock: KnockModel::default(),
             preset: 0,
             sustain: false,
@@ -128,9 +147,11 @@ impl Synth {
     }
 
     pub fn set_preset(&mut self, idx: usize) {
-        if let Some((_, t)) = PRESETS.get(idx) {
+        if let Some(p) = PRESETS.get(idx) {
             self.preset = idx;
-            self.tone = *t;
+            self.tone = p.tone;
+            self.engine = p.engine;
+            self.ideal = p.ideal;
         }
     }
 
@@ -156,7 +177,12 @@ impl Synth {
             }
         }
         let idx = self.allocate();
-        let mut spec = voice_spec_with(key, vel, &self.tone, &self.knock, self.sr);
+        let mut spec = match self.engine {
+            Engine::Fitted => voice_spec_with(key, vel, &self.tone, &self.knock, self.sr),
+            Engine::Ideal => {
+                ideal_voice_spec(key, vel, &self.tone, &self.ideal, &self.knock, self.sr)
+            }
+        };
         spec.pan *= self.width;
         self.serial += 1;
         self.voices[idx].start(key, &spec, self.serial);
@@ -236,6 +262,19 @@ impl Synth {
             WIDTH => self.width = value.clamp(0.0, 2.0),
             STRINGS => t.strings = value.round().clamp(0.0, 3.0) as u8,
             UNISON_MIX => t.unison_mix = value.clamp(0.0, 1.0),
+            ENGINE => {
+                self.engine = if value >= 0.5 {
+                    Engine::Ideal
+                } else {
+                    Engine::Fitted
+                }
+            }
+            STRIKE => self.ideal.strike = value.clamp(0.03, 0.3),
+            NOTCH => self.ideal.notch = value.clamp(0.0, 1.0),
+            BOARD => self.ideal.board = value.clamp(0.2, 5.0),
+            HIGH_DAMP => self.ideal.high_damp = value.clamp(0.1, 8.0),
+            DYNAMICS => self.ideal.dynamics = value.clamp(0.2, 2.5),
+            AFTERSOUND => self.ideal.aftersound = value.clamp(0.0, 20.0),
             _ => {}
         }
     }
@@ -259,6 +298,13 @@ impl Synth {
             WIDTH => self.width,
             STRINGS => t.strings as f32,
             UNISON_MIX => t.unison_mix,
+            ENGINE => (self.engine == Engine::Ideal) as u32 as f32,
+            STRIKE => self.ideal.strike,
+            NOTCH => self.ideal.notch,
+            BOARD => self.ideal.board,
+            HIGH_DAMP => self.ideal.high_damp,
+            DYNAMICS => self.ideal.dynamics,
+            AFTERSOUND => self.ideal.aftersound,
             _ => 0.0,
         }
     }
@@ -321,19 +367,48 @@ mod tests {
 
     #[test]
     fn every_key_sounds_and_stops() {
-        for key in (21..=108u8).step_by(5) {
-            let mut s = Synth::new(48000.0);
-            s.set_param(param::REVERB, 0.0);
-            s.note_on(key, 100);
-            let (peak, rms) = run(&mut s, 0.3);
-            assert!(peak > 1e-3 && rms > 1e-5, "key {key}: peak {peak}");
-            assert!(peak < 1.0);
-            s.note_off(key);
-            run(&mut s, 3.0);
-            if key < 90 {
-                assert_eq!(s.active_voices(), 0, "damped key {key} still sounding");
+        // both engines: the fitted Concert Grand and the Ideal Grand
+        let ideal = PRESETS
+            .iter()
+            .position(|p| p.engine == Engine::Ideal)
+            .unwrap();
+        for preset in [0, ideal] {
+            for key in (21..=108u8).step_by(5) {
+                let mut s = Synth::new(48000.0);
+                s.set_preset(preset);
+                s.set_param(param::REVERB, 0.0);
+                s.note_on(key, 100);
+                let (peak, rms) = run(&mut s, 0.3);
+                assert!(
+                    peak > 1e-3 && rms > 1e-5,
+                    "preset {preset} key {key}: peak {peak}"
+                );
+                assert!(peak < 1.0);
+                s.note_off(key);
+                run(&mut s, 3.0);
+                if key < 90 {
+                    assert_eq!(
+                        s.active_voices(),
+                        0,
+                        "preset {preset}: damped key {key} still sounding"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn engine_param_switches_engine() {
+        let mut s = Synth::new(48000.0);
+        assert_eq!(s.param(param::ENGINE), 0.0);
+        s.set_param(param::ENGINE, 1.0);
+        assert_eq!(s.param(param::ENGINE), 1.0);
+        s.set_param(param::STRIKE, 0.1);
+        s.set_param(param::AFTERSOUND, 2.0);
+        assert!((s.param(param::STRIKE) - 0.1).abs() < 1e-6);
+        s.note_on(60, 100);
+        let (peak, _) = run(&mut s, 0.2);
+        assert!(peak > 1e-3 && peak < 1.0);
     }
 
     #[test]

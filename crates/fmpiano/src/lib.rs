@@ -11,6 +11,7 @@
 //!
 //! The crate has no dependencies and builds for `wasm32-unknown-unknown`.
 
+pub mod ideal;
 pub mod model;
 pub mod reverb;
 pub mod sine;
@@ -18,5 +19,6 @@ pub mod synth;
 pub mod tables;
 pub mod voice;
 
+pub use ideal::IdealParams;
 pub use model::{Tone, PRESETS};
 pub use synth::{param, Synth};
