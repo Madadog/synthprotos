@@ -69,6 +69,13 @@ impl LoopMode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SidebarTab {
+    #[default]
+    Bookmarks,
+    Playlist,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -82,6 +89,11 @@ pub struct Settings {
     pub loop_gap: f64,
     /// Dynamic range shown by the spectrogram, dB.
     pub range_db: f32,
+    /// Speed changes time-stretch (keeping pitch) rather than resample.
+    pub keep_pitch: bool,
+    /// When a track ends, play the next one in the playlist.
+    pub auto_advance: bool,
+    pub sidebar: SidebarTab,
     pub last_dir: Option<PathBuf>,
 }
 
@@ -95,6 +107,9 @@ impl Default for Settings {
             loop_mode: LoopMode::default(),
             loop_gap: 0.0,
             range_db: 70.0,
+            keep_pitch: true,
+            auto_advance: true,
+            sidebar: SidebarTab::default(),
             last_dir: None,
         }
     }
@@ -156,6 +171,93 @@ impl Session {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Playlist {
+    pub name: String,
+    pub tracks: Vec<PathBuf>,
+}
+
+impl Playlist {
+    /// Append the files that are not already in the playlist.
+    pub fn add(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if !self.tracks.contains(&path) {
+                self.tracks.push(path);
+            }
+        }
+    }
+
+    pub fn position(&self, path: Option<&Path>) -> Option<usize> {
+        self.tracks.iter().position(|t| Some(t.as_path()) == path)
+    }
+
+    /// The track `step` places after `current`. From a track that is not in
+    /// the playlist, "next" is the first track.
+    pub fn neighbour(&self, current: Option<&Path>, step: isize) -> Option<&PathBuf> {
+        match self.position(current) {
+            Some(i) => self.tracks.get(i.checked_add_signed(step)?),
+            None if step > 0 => self.tracks.first(),
+            None => None,
+        }
+    }
+}
+
+/// All playlists, and which one is showing.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct Library {
+    pub playlists: Vec<Playlist>,
+    pub current: usize,
+}
+
+impl Default for Library {
+    fn default() -> Self {
+        Library { playlists: vec![Playlist { name: "Playlist 1".into(), tracks: Vec::new() }], current: 0 }
+    }
+}
+
+impl Library {
+    pub fn load() -> Library {
+        let mut library: Library = load(data_dir().map(|d| d.join("playlists.json")));
+        if library.playlists.is_empty() {
+            library = Library::default();
+        }
+        library.current = library.current.min(library.playlists.len() - 1);
+        library
+    }
+
+    pub fn save(&self) {
+        save(data_dir().map(|d| d.join("playlists.json")), self);
+    }
+
+    pub fn playlist(&self) -> &Playlist {
+        &self.playlists[self.current]
+    }
+
+    pub fn playlist_mut(&mut self) -> &mut Playlist {
+        &mut self.playlists[self.current]
+    }
+
+    /// Add an empty playlist with an unused name and show it.
+    pub fn add_playlist(&mut self) {
+        let name = (1..)
+            .map(|n| format!("Playlist {n}"))
+            .find(|name| self.playlists.iter().all(|p| &p.name != name))
+            .unwrap();
+        self.playlists.push(Playlist { name, tracks: Vec::new() });
+        self.current = self.playlists.len() - 1;
+    }
+
+    /// Delete the showing playlist; there is always at least one.
+    pub fn remove_playlist(&mut self) {
+        self.playlists.remove(self.current);
+        if self.playlists.is_empty() {
+            *self = Library::default();
+        }
+        self.current = self.current.min(self.playlists.len() - 1);
+    }
+}
+
 fn data_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("woodshed"))
 }
@@ -213,6 +315,32 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_navigation() {
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let mut list = Playlist { name: "Set".into(), tracks: Vec::new() };
+        list.add(paths(&["a.mp3", "b.mp3"]));
+        list.add(paths(&["b.mp3", "c.mp3"]));
+        assert_eq!(list.tracks, paths(&["a.mp3", "b.mp3", "c.mp3"]));
+
+        let at = |name: &str, step| list.neighbour(Some(Path::new(name)), step).map(|p| p.to_str().unwrap());
+        assert_eq!(at("a.mp3", 1), Some("b.mp3"));
+        assert_eq!(at("c.mp3", 1), None);
+        assert_eq!(at("b.mp3", -1), Some("a.mp3"));
+        assert_eq!(at("a.mp3", -1), None);
+        // From a track outside the playlist, "next" starts the playlist.
+        assert_eq!(at("x.mp3", 1), Some("a.mp3"));
+        assert_eq!(at("x.mp3", -1), None);
+        assert_eq!(list.neighbour(None, 1), Some(&PathBuf::from("a.mp3")));
+
+        let mut library = Library::default();
+        library.add_playlist();
+        assert_eq!((library.current, library.playlist().name.as_str()), (1, "Playlist 2"));
+        library.remove_playlist();
+        library.remove_playlist();
+        assert_eq!((library.playlists.len(), library.current), (1, 0));
+    }
 
     #[test]
     fn bookmark_navigation() {

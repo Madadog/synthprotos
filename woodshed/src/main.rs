@@ -11,7 +11,7 @@ mod track;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    let open = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+    let files: Vec<_> = std::env::args_os().skip(1).map(std::path::PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Woodshed")
@@ -21,5 +21,5 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native("Woodshed", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, open)))))
+    eframe::run_native("Woodshed", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, files)))))
 }

@@ -14,7 +14,7 @@ use eframe::egui::{
 use crate::analysis::{Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
 use crate::display::{Drag, Tiles};
 use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
-use crate::session::{Follow, LoopMode, Session, Settings, ViewMode};
+use crate::session::{Follow, Library, LoopMode, Session, Settings, SidebarTab, ViewMode};
 use crate::track::{self, Track};
 
 pub const ACCENT: Color32 = Color32::from_rgb(255, 184, 76);
@@ -64,6 +64,16 @@ pub struct App {
     loading: Option<Loading>,
     error: Option<String>,
     dialog: Option<Receiver<Option<PathBuf>>>,
+    /// Pending "add files to the playlist" dialog.
+    add_dialog: Option<Receiver<Option<Vec<PathBuf>>>>,
+
+    library: Library,
+    library_dirty: bool,
+    /// The file that is loaded, or being loaded.
+    current_path: Option<PathBuf>,
+    /// Start playing as soon as the file being loaded is ready.
+    autoplay: bool,
+    confirm_delete: bool,
 
     /// Heard playback position this frame, seconds.
     pub pos: f64,
@@ -83,12 +93,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, open: Option<PathBuf>) -> App {
+    pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> App {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         let settings = Settings::load();
         let saved_settings = serde_json::to_string(&settings).unwrap_or_default();
         let engine = Arc::new(Mutex::new(Engine::new()));
         engine.lock().unwrap().set_volume(settings.volume);
+        engine.lock().unwrap().set_keep_pitch(settings.keep_pitch);
         let output = Output::open(&engine, None);
         let mut app = App {
             engine,
@@ -101,6 +112,12 @@ impl App {
             loading: None,
             error: None,
             dialog: None,
+            add_dialog: None,
+            library: Library::load(),
+            library_dirty: false,
+            current_path: None,
+            autoplay: false,
+            confirm_delete: false,
             pos: 0.0,
             playing: false,
             cue: 0.0,
@@ -112,9 +129,7 @@ impl App {
             show_help: false,
             focus_label: None,
         };
-        if let Some(path) = open {
-            app.open(&path, &cc.egui_ctx);
-        }
+        app.open_files(files, &cc.egui_ctx);
         app
     }
 
@@ -124,7 +139,41 @@ impl App {
 
     // ------------------------------------------------------------ loading
 
+    /// One file is simply opened; several are added to the playlist (and
+    /// the first opened if nothing is loaded yet).
+    fn open_files(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
+        let files: Vec<PathBuf> = files.iter().map(|p| absolute(p)).collect();
+        match files.as_slice() {
+            [] => {}
+            [one] => self.open(one, ctx),
+            [first, ..] => {
+                if self.current_path.is_none() {
+                    self.open(first, ctx);
+                }
+                self.add_to_playlist(files);
+            }
+        }
+    }
+
+    fn add_to_playlist(&mut self, files: Vec<PathBuf>) {
+        self.library.playlist_mut().add(files);
+        self.library_dirty = true;
+        self.settings.sidebar = SidebarTab::Playlist;
+    }
+
+    /// Open the playlist track `step` places from the current one.
+    fn playlist_step(&mut self, step: isize, ctx: &egui::Context) -> bool {
+        let Some(path) = self.library.playlist().neighbour(self.current_path.as_deref(), step).cloned() else {
+            return false;
+        };
+        self.autoplay = self.playing;
+        self.open(&path, ctx);
+        true
+    }
+
     fn open(&mut self, path: &Path, ctx: &egui::Context) {
+        let path = &absolute(path);
+        self.current_path = Some(path.clone());
         let progress = Arc::new(AtomicU32::new(0));
         let (tx, rx) = channel();
         let (path_buf, thread_progress, ctx) = (path.to_path_buf(), progress.clone(), ctx.clone());
@@ -159,7 +208,31 @@ impl App {
         self.dialog = Some(rx);
     }
 
+    fn add_dialog(&mut self, ctx: &egui::Context) {
+        if self.add_dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (dir, ctx) = (self.settings.last_dir.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().add_filter("Audio", track::AUDIO_EXTENSIONS);
+            if let Some(dir) = dir {
+                dialog = dialog.set_directory(dir);
+            }
+            let _ = tx.send(dialog.pick_files());
+            ctx.request_repaint();
+        });
+        self.add_dialog = Some(rx);
+    }
+
     fn poll_background(&mut self, ctx: &egui::Context) {
+        if let Some(choice) = self.add_dialog.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.add_dialog = None;
+            if let Some(files) = choice {
+                self.settings.last_dir = files.first().and_then(|f| f.parent()).map(Path::to_path_buf);
+                self.add_to_playlist(files);
+            }
+        }
         if let Some(rx) = &self.dialog {
             if let Ok(choice) = rx.try_recv() {
                 self.dialog = None;
@@ -168,13 +241,15 @@ impl App {
                 }
             }
         }
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
-            self.open(&path, ctx);
-        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        self.open_files(dropped, ctx);
         let Some(result) = self.loading.as_ref().and_then(|l| l.rx.try_recv().ok()) else { return };
         self.loading = None;
         match result {
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                self.error = Some(e);
+                self.autoplay = false;
+            }
             Ok((track, peaks)) => {
                 self.save_session();
                 if let Some(old) = self.loaded.take() {
@@ -186,6 +261,9 @@ impl App {
                     let mut engine = self.engine.lock().unwrap();
                     engine.set_track(Some(track.clone()));
                     engine.set_speed(self.session.speed);
+                    if std::mem::take(&mut self.autoplay) {
+                        engine.play();
+                    }
                 }
                 // Reopen the device at the track's rate where possible.
                 self.output = Output::open(&self.engine, Some(track.sample_rate));
@@ -292,6 +370,11 @@ impl App {
         self.touch_session();
     }
 
+    fn set_keep_pitch(&mut self, keep_pitch: bool) {
+        self.settings.keep_pitch = keep_pitch;
+        self.engine.lock().unwrap().set_keep_pitch(keep_pitch);
+    }
+
     /// The region the engine should loop, given the loop mode.
     fn loop_region(&self) -> Option<(f64, f64)> {
         match self.settings.loop_mode {
@@ -392,6 +475,15 @@ impl App {
                 }
             }
         }
+        if key(Key::N) {
+            self.playlist_step(1, ctx);
+        }
+        if key(Key::P) {
+            self.playlist_step(-1, ctx);
+        }
+        if key(Key::T) {
+            self.set_keep_pitch(!self.settings.keep_pitch);
+        }
         if key(Key::L) {
             self.settings.loop_mode = match self.settings.loop_mode {
                 LoopMode::Off if self.session.selection.is_some() => LoopMode::Selection,
@@ -488,7 +580,137 @@ impl App {
     fn sidebar(&mut self, ui: &mut Ui) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.heading("Bookmarks");
+            ui.selectable_value(&mut self.settings.sidebar, SidebarTab::Bookmarks, RichText::new("Bookmarks").size(15.0));
+            ui.selectable_value(&mut self.settings.sidebar, SidebarTab::Playlist, RichText::new("Playlist").size(15.0));
+        });
+        ui.separator();
+        let options_height = 250.0;
+        let list_height = (ui.available_height() - options_height).max(80.0);
+        match self.settings.sidebar {
+            SidebarTab::Bookmarks => self.bookmark_list(ui, list_height),
+            SidebarTab::Playlist => self.playlist(ui, list_height),
+        }
+        self.options(ui);
+    }
+
+    fn playlist(&mut self, ui: &mut Ui, height: f32) {
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = if self.confirm_delete { "Really delete?" } else { "Delete" };
+                let delete = ui.button(label).on_hover_text("Delete this playlist (the audio files are untouched)");
+                if delete.clicked() {
+                    if self.confirm_delete || self.library.playlist().tracks.is_empty() {
+                        self.library.remove_playlist();
+                        self.library_dirty = true;
+                        self.confirm_delete = false;
+                    } else {
+                        self.confirm_delete = true;
+                    }
+                } else if !delete.hovered() {
+                    self.confirm_delete = false;
+                }
+                if ui.button("New").on_hover_text("Start a new, empty playlist").clicked() {
+                    self.library.add_playlist();
+                    self.library_dirty = true;
+                }
+                let mut chosen = self.library.current;
+                egui::ComboBox::from_id_salt("playlists")
+                    .width(ui.available_width())
+                    .selected_text(self.library.playlist().name.clone())
+                    .show_ui(ui, |ui| {
+                        for (i, playlist) in self.library.playlists.iter().enumerate() {
+                            ui.selectable_value(&mut chosen, i, format!("{} ({})", playlist.name, playlist.tracks.len()));
+                        }
+                    });
+                if chosen != self.library.current {
+                    self.library.current = chosen;
+                    self.library_dirty = true;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.weak("Name");
+            let name = &mut self.library.playlist_mut().name;
+            if ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY)).changed() {
+                self.library_dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("+ Files…").on_hover_text("Add audio files (or drop several on the window)").clicked() {
+                self.add_dialog(ui.ctx());
+            }
+            let current = self.current_path.clone().filter(|p| self.library.playlist().position(Some(p)).is_none());
+            if ui
+                .add_enabled(current.is_some(), egui::Button::new("+ Current track"))
+                .on_hover_text("Add the track that is open now")
+                .clicked()
+            {
+                self.add_to_playlist(current.into_iter().collect());
+            }
+        });
+        ui.add_space(2.0);
+
+        enum Action {
+            Open(PathBuf),
+            Remove(usize),
+            Move(usize, usize),
+        }
+        let mut action = None;
+        let tracks = &self.library.playlist().tracks;
+        let current = self.library.playlist().position(self.current_path.as_deref());
+        let list_height = (height - 104.0).max(60.0);
+        egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
+            if tracks.is_empty() {
+                ui.weak("This playlist is empty.\nAdd files, or drop several on the window.");
+            }
+            for (i, path) in tracks.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let playing = current == Some(i);
+                    let colour = if playing { ACCENT } else { ui.visuals().weak_text_color() };
+                    let number = RichText::new(format!("{}", i + 1)).color(colour).monospace();
+                    ui.add_sized([18.0, 18.0], egui::Label::new(number));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Remove from the playlist").clicked() {
+                            action = Some(Action::Remove(i));
+                        }
+                        if ui.add_enabled(i + 1 < tracks.len(), egui::Button::new(RichText::new("↓").monospace()).small()).clicked() {
+                            action = Some(Action::Move(i, i + 1));
+                        }
+                        if ui.add_enabled(i > 0, egui::Button::new(RichText::new("↑").monospace()).small()).clicked() {
+                            action = Some(Action::Move(i, i - 1));
+                        }
+                        let name = path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy();
+                        let mut text = RichText::new(name);
+                        if playing {
+                            text = text.color(ACCENT);
+                        }
+                        let row = egui::Button::new(text).frame(false).truncate();
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            if ui.add(row).on_hover_text(path.to_string_lossy()).clicked() {
+                                action = Some(Action::Open(path.clone()));
+                            }
+                        });
+                    });
+                });
+            }
+        });
+        ui.checkbox(&mut self.settings.auto_advance, "Play the next track automatically")
+            .on_hover_text("When a track ends and no loop is on (N / P skip by hand)");
+        match action {
+            Some(Action::Open(path)) => {
+                self.autoplay = self.playing;
+                self.open(&path, ui.ctx());
+            }
+            Some(Action::Remove(i)) => drop(self.library.playlist_mut().tracks.remove(i)),
+            Some(Action::Move(from, to)) => self.library.playlist_mut().tracks.swap(from, to),
+            None => return,
+        }
+        self.library_dirty = true;
+    }
+
+    fn bookmark_list(&mut self, ui: &mut Ui, height: f32) {
+        ui.horizontal(|ui| {
+            ui.weak("B drops one at the playhead");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add_enabled(self.loaded.is_some(), egui::Button::new("+ Add"))
@@ -499,17 +721,15 @@ impl App {
                 }
             });
         });
-        ui.separator();
-
-        let options_height = 250.0;
-        let list_height = (ui.available_height() - options_height).max(80.0);
+        ui.add_space(2.0);
+        let list_height = (height - 26.0).max(60.0);
         let mut seek = None;
         let mut delete = None;
         let mut edited = false;
         let current = self.session.bookmarks.iter().rposition(|b| b.time <= self.pos + 1e-6);
         egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
             if self.session.bookmarks.is_empty() {
-                ui.weak("No bookmarks yet.\nPress B to drop one at the playhead.");
+                ui.weak("No bookmarks yet.");
             }
             for (i, bookmark) in self.session.bookmarks.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
@@ -549,7 +769,9 @@ impl App {
         if edited {
             self.touch_session();
         }
+    }
 
+    fn options(&mut self, ui: &mut Ui) {
         ui.separator();
         ui.label(RichText::new("Playhead").strong());
         egui::ComboBox::from_id_salt("follow")
@@ -626,11 +848,17 @@ impl App {
             let slider = egui::Slider::new(&mut percent, MIN_SPEED * 100.0..=MAX_SPEED * 100.0)
                 .step_by(1.0)
                 .suffix("%");
-            if ui.add(slider).on_hover_text("Playback speed, pitch preserved (↑ / ↓)").changed() {
+            if ui.add(slider).on_hover_text("Playback speed (↑ / ↓)").changed() {
                 self.set_speed(percent / 100.0);
             }
             if ui.add_enabled(self.session.speed != 1.0, egui::Button::new("1×")).on_hover_text("Back to normal speed").clicked() {
                 self.set_speed(1.0);
+            }
+            let mut keep_pitch = self.settings.keep_pitch;
+            let hint = "On: time-stretch, so slowing down keeps the pitch.\n\
+                        Off: plain resampling like a tape machine, so pitch follows speed (T)";
+            if ui.checkbox(&mut keep_pitch, "Keep pitch").on_hover_text(hint).changed() {
+                self.set_keep_pitch(keep_pitch);
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -698,6 +926,8 @@ impl App {
             ("← / →", "Seek 2 s (Shift: 10 s)"),
             ("Home", "Back to the start"),
             ("↑ / ↓", "Speed up / slow down by 5%"),
+            ("T", "Speed keeps pitch (time-stretch) on / off"),
+            ("N / P", "Next / previous track in the playlist"),
             ("B", "Drop a bookmark at the playhead (Shift+B: and name it)"),
             ("[ / ]", "Previous / next bookmark (also PgUp / PgDn)"),
             ("1 – 9", "Jump to bookmark 1 – 9"),
@@ -754,13 +984,23 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.poll_background(&ctx);
+        let finished;
         {
             let mut engine = self.engine.lock().unwrap();
             self.pos = engine.position();
             self.playing = engine.is_playing();
-            if engine.take_finished() && self.settings.return_on_pause {
-                engine.seek(self.cue);
-                self.pos = self.cue;
+            finished = engine.take_finished();
+        }
+        if finished {
+            // Move on through the playlist, unless a loop is being rehearsed.
+            self.playing = true;
+            let advance = self.settings.auto_advance && self.settings.loop_mode == LoopMode::Off;
+            if !(advance && self.playlist_step(1, &ctx)) {
+                self.playing = false;
+                if self.settings.return_on_pause {
+                    self.engine.lock().unwrap().seek(self.cue);
+                    self.pos = self.cue;
+                }
             }
         }
         self.hotkeys(&ctx);
@@ -798,6 +1038,9 @@ impl eframe::App for App {
         if !ctx.egui_is_using_pointer() && !ctx.text_edit_focused() {
             self.save_session();
             self.save_settings();
+            if std::mem::take(&mut self.library_dirty) {
+                self.library.save();
+            }
         }
     }
 
@@ -805,6 +1048,7 @@ impl eframe::App for App {
         self.session_dirty |= self.loaded.is_some();
         self.save_session();
         self.save_settings();
+        self.library.save();
     }
 }
 
@@ -814,6 +1058,11 @@ enum Icon {
     Pause,
     Previous,
     Next,
+}
+
+/// Absolute form of a path, so playlist entries survive a change of directory.
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// A transport button with a painted icon (no dependence on font glyphs).

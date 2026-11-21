@@ -26,6 +26,9 @@ pub struct Engine {
     /// Source position of the previous stretcher frame, for loop-end detection.
     prev_pos: f64,
     speed: f64,
+    /// Time-stretch so speed changes keep the pitch; otherwise speed works
+    /// like a tape machine and pitch follows it.
+    keep_pitch: bool,
     volume: f32,
     /// Loop region in source frames.
     loop_region: Option<(f64, f64)>,
@@ -60,6 +63,7 @@ impl Engine {
             pos: 0.0,
             prev_pos: 0.0,
             speed: 1.0,
+            keep_pitch: true,
             volume: 0.8,
             loop_region: None,
             loop_gap: 0.0,
@@ -155,7 +159,7 @@ impl Engine {
     pub fn position(&self) -> f64 {
         // The FIFO is refilled only when empty, so this lies between the
         // previous and the next stretcher frame.
-        let mut p = self.pos - self.fifo.len() as f64 * self.speed;
+        let mut p = self.pos - self.fifo.len() as f64 * self.stretch();
         if self.pos >= self.frames() {
             p = self.frames(); // only the final fade-out is left
         }
@@ -166,6 +170,19 @@ impl Engine {
             }
         }
         (p.max(0.0) / self.rate()).min(self.frames() / self.rate())
+    }
+
+    pub fn set_keep_pitch(&mut self, keep_pitch: bool) {
+        self.keep_pitch = keep_pitch;
+    }
+
+    /// Source frames consumed per frame the stretcher emits.
+    fn stretch(&self) -> f64 {
+        if self.keep_pitch {
+            self.speed
+        } else {
+            1.0
+        }
     }
 
     pub fn set_speed(&mut self, speed: f64) {
@@ -226,7 +243,7 @@ impl Engine {
         let nominal = self.pos.round() as i64;
         let start = match self.natural {
             None => nominal,
-            Some(nat) if (self.speed - 1.0).abs() < 1e-3 => nat,
+            Some(nat) if (self.stretch() - 1.0).abs() < 1e-3 => nat,
             Some(nat) => self.best_match(track, nominal, nat),
         };
         for (i, (acc, w)) in self.ola.iter_mut().zip(&self.window).enumerate() {
@@ -239,7 +256,7 @@ impl Engine {
         self.ola[hop..].iter_mut().for_each(|f| *f = [0.0; 2]);
         self.natural = Some(start + hop as i64);
         self.prev_pos = self.pos;
-        self.pos += hop as f64 * self.speed;
+        self.pos += hop as f64 * self.stretch();
     }
 
     /// Find the frame start near `nominal` whose waveform best continues the
@@ -299,7 +316,8 @@ impl Engine {
     pub fn render(&mut self, out: &mut [f32], channels: usize) {
         out.fill(0.0);
         let Some(track) = self.track.clone() else { return };
-        let ratio = track.sample_rate as f64 / self.out_rate;
+        // Without time-stretching, speed is applied here by resampling.
+        let ratio = track.sample_rate as f64 / self.out_rate * (self.speed / self.stretch());
         let fade_step = (1.0 / (0.008 * self.out_rate)) as f32;
         for frame in out.chunks_mut(channels.max(1)) {
             if self.playing {
@@ -516,6 +534,17 @@ mod tests {
         let rms = (body.iter().map(|x| x * x).sum::<f32>() / body.len() as f32).sqrt();
         assert!((rms - 0.5 / 2f32.sqrt()).abs() < 0.02, "rms {rms}");
         // Two seconds of output at half speed covers one second of the track.
+        assert!((e.position() - 1.0).abs() < 0.05, "position {}", e.position());
+    }
+
+    #[test]
+    fn half_speed_without_stretch_drops_an_octave() {
+        let mut e = engine(sine_track(440.0, 3.0));
+        e.set_keep_pitch(false);
+        e.set_speed(0.5);
+        e.play();
+        let out = render(&mut e, 2 * SR as usize);
+        assert!((zero_crossing_freq(&out[4800..]) - 220.0).abs() < 0.5);
         assert!((e.position() - 1.0).abs() < 0.05, "position {}", e.position());
     }
 

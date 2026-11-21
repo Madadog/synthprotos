@@ -18,7 +18,13 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
 - **Labelled bookmarks**: `B` drops one at the playhead, `[` and `]` skip
   between them, `1`–`9` jump straight to one. Bookmarks, the loop selection
   and speed are remembered per file.
-- **Speed** from 25% to 150% without changing pitch.
+- **Speed** from 25% to 150%. With "Keep pitch" on it time-stretches, so the
+  notes stay where they are; with it off it resamples like a tape machine,
+  so half speed is also an octave down.
+- **Playlists**: any number of named playlists of files. Add files from the
+  playlist tab, by dropping several on the window, or on the command line.
+  `N` and `P` skip between tracks, and the next track starts by itself when
+  one ends (unless a loop is on).
 
 Reads MP3, FLAC, WAV, Ogg Vorbis, AAC/M4A, ALAC, AIFF and CAF.
 
@@ -26,7 +32,7 @@ Reads MP3, FLAC, WAV, Ogg Vorbis, AAC/M4A, ALAC, AIFF and CAF.
 
 ```sh
 cd woodshed
-cargo run --release -- path/to/song.mp3   # the path is optional
+cargo run --release -- path/to/song.mp3   # optional; several files go into the playlist
 ```
 
 On Linux, the ALSA headers are needed to build (`libasound2-dev` on
@@ -43,6 +49,8 @@ it has its own `Cargo.lock`.
 | `←` `→` | Seek 2 s (`Shift`: 10 s) |
 | `Home` | Back to the start |
 | `↑` `↓` | Speed up / slow down by 5% |
+| `T` | Speed keeps pitch (time-stretch) on / off |
+| `N` `P` | Next / previous track in the playlist |
 | `B` | Drop a bookmark at the playhead (`Shift+B`: and name it) |
 | `[` `]` | Previous / next bookmark (also `PgUp` / `PgDn`) |
 | `1`–`9` | Jump to bookmark 1–9 |
@@ -68,7 +76,7 @@ it has its own `Cargo.lock`.
 ## How it works
 
 - `track.rs` decodes the whole file into memory with Symphonia.
-- `engine.rs` plays it: a WSOLA time-stretcher for the speed control, loop
+- `engine.rs` plays it: an optional WSOLA time-stretcher for the speed control, loop
   handling, and resampling to the output device, driven by a cpal stream.
 - `analysis.rs` builds the waveform peak pyramid and, on background threads,
   the spectrogram: three FFT sizes blended onto a grid of four rows per
@@ -76,5 +84,5 @@ it has its own `Cargo.lock`.
 - `display.rs` draws the zoomable view; the spectrogram is cached as texture
   tiles at power-of-two zoom levels.
 - `app.rs` holds the state, hotkeys, transport bar and bookmark sidebar;
-  `session.rs` saves settings and per-file bookmarks under the user data
-  directory.
+  `session.rs` saves settings, playlists and per-file bookmarks under the
+  user data directory.
