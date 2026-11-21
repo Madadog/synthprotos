@@ -210,6 +210,10 @@ tools/ideal/           calibration of the idealised laws (calibration.json), Pyt
                        prototype of the law -> stacks mapping, smoothness measurement
 ```
 
+`woodshed/` is a separate project that lives in this repository: an egui music
+player for transcription and rehearsal. It is not part of the workspace above;
+see [woodshed/README.md](woodshed/README.md).
+
 ## Building
 
 ```sh

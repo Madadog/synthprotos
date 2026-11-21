@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/fmpiano", "crates/fmpiano-cli", "crates/fmpiano-wasm"]
+# woodshed is a standalone GUI app with its own lockfile and profiles.
+exclude = ["woodshed"]
 
 [workspace.package]
 version = "0.1.0"
