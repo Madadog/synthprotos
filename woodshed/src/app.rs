@@ -14,7 +14,8 @@ use eframe::egui::{
 use crate::analysis::{Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
 use crate::display::{Drag, Tiles};
 use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
-use crate::session::{Follow, Library, LoopMode, Session, Settings, SidebarTab, ViewMode};
+use crate::playlist_io;
+use crate::session::{Follow, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
 use crate::track::{self, Track};
 
 pub const ACCENT: Color32 = Color32::from_rgb(255, 184, 76);
@@ -74,6 +75,8 @@ pub struct App {
     /// Start playing as soon as the file being loaded is ready.
     autoplay: bool,
     confirm_delete: bool,
+    export_dialog: Option<Receiver<Option<PathBuf>>>,
+    show_preferences: bool,
 
     /// Heard playback position this frame, seconds.
     pub pos: f64,
@@ -118,6 +121,8 @@ impl App {
             current_path: None,
             autoplay: false,
             confirm_delete: false,
+            export_dialog: None,
+            show_preferences: false,
             pos: 0.0,
             playing: false,
             cue: 0.0,
@@ -142,7 +147,24 @@ impl App {
     /// One file is simply opened; several are added to the playlist (and
     /// the first opened if nothing is loaded yet).
     fn open_files(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
-        let files: Vec<PathBuf> = files.iter().map(|p| absolute(p)).collect();
+        let (lists, files): (Vec<PathBuf>, Vec<PathBuf>) =
+            files.iter().map(|p| absolute(p)).partition(|p| playlist_io::is_playlist(p));
+        // A playlist file becomes a playlist of its own, named after the file.
+        for list in lists {
+            match playlist_io::read(&list) {
+                Err(e) => self.error = Some(e),
+                Ok(tracks) => {
+                    if files.is_empty() && self.current_path.is_none() {
+                        self.open(&tracks[0], ctx);
+                    }
+                    let name = list.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.library.import(&name, tracks);
+                    self.library_dirty = true;
+                    self.settings.sidebar = SidebarTab::Playlist;
+                    self.settings.last_dir = list.parent().map(Path::to_path_buf);
+                }
+            }
+        }
         match files.as_slice() {
             [] => {}
             [one] => self.open(one, ctx),
@@ -155,8 +177,20 @@ impl App {
         }
     }
 
+    /// Add files to the showing playlist; playlist files add what they list.
     fn add_to_playlist(&mut self, files: Vec<PathBuf>) {
-        self.library.playlist_mut().add(files);
+        let mut tracks = Vec::new();
+        for file in files {
+            if !playlist_io::is_playlist(&file) {
+                tracks.push(file);
+                continue;
+            }
+            match playlist_io::read(&file) {
+                Ok(listed) => tracks.extend(listed),
+                Err(e) => self.error = Some(e),
+            }
+        }
+        self.library.playlist_mut().add(tracks);
         self.library_dirty = true;
         self.settings.sidebar = SidebarTab::Playlist;
     }
@@ -198,7 +232,10 @@ impl App {
         let (tx, rx) = channel();
         let (dir, ctx) = (self.settings.last_dir.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new().add_filter("Audio", track::AUDIO_EXTENSIONS);
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("Audio and playlists", &[track::AUDIO_EXTENSIONS, playlist_io::EXTENSIONS].concat())
+                .add_filter("Audio", track::AUDIO_EXTENSIONS)
+                .add_filter("Playlists", playlist_io::EXTENSIONS);
             if let Some(dir) = dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -215,7 +252,10 @@ impl App {
         let (tx, rx) = channel();
         let (dir, ctx) = (self.settings.last_dir.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new().add_filter("Audio", track::AUDIO_EXTENSIONS);
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("Audio and playlists", &[track::AUDIO_EXTENSIONS, playlist_io::EXTENSIONS].concat())
+                .add_filter("Audio", track::AUDIO_EXTENSIONS)
+                .add_filter("Playlists", playlist_io::EXTENSIONS);
             if let Some(dir) = dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -225,7 +265,37 @@ impl App {
         self.add_dialog = Some(rx);
     }
 
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        if self.export_dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let (dir, ctx, name) = (self.settings.last_dir.clone(), ctx.clone(), self.library.playlist().name.clone());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .add_filter("M3U playlist", &["m3u8", "m3u"])
+                .add_filter("PLS playlist", &["pls"])
+                .add_filter("XSPF playlist", &["xspf"])
+                .set_file_name(format!("{name}.m3u8"));
+            if let Some(dir) = dir {
+                dialog = dialog.set_directory(dir);
+            }
+            let _ = tx.send(dialog.save_file());
+            ctx.request_repaint();
+        });
+        self.export_dialog = Some(rx);
+    }
+
     fn poll_background(&mut self, ctx: &egui::Context) {
+        if let Some(choice) = self.export_dialog.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.export_dialog = None;
+            if let Some(mut path) = choice {
+                if !playlist_io::is_playlist(&path) {
+                    path.as_mut_os_string().push(".m3u8");
+                }
+                self.error = playlist_io::write(&path, &self.library.playlist().tracks).err();
+            }
+        }
         if let Some(choice) = self.add_dialog.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.add_dialog = None;
             if let Some(files) = choice {
@@ -236,9 +306,7 @@ impl App {
         if let Some(rx) = &self.dialog {
             if let Ok(choice) = rx.try_recv() {
                 self.dialog = None;
-                if let Some(path) = choice {
-                    self.open(&path, ctx);
-                }
+                self.open_files(choice.into_iter().collect(), ctx);
             }
         }
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -431,6 +499,9 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.open_dialog(ctx);
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Comma)) {
+            self.show_preferences = !self.show_preferences;
+        }
         if ctx.text_edit_focused() {
             return;
         }
@@ -508,10 +579,10 @@ impl App {
         }
         for (k, step) in [(Key::ArrowLeft, -1.0), (Key::ArrowRight, 1.0)] {
             if key(k) {
-                self.seek_and_show(self.pos + 2.0 * step);
+                self.seek_and_show(self.pos + self.settings.seek_step * step);
             }
             if shift(k) {
-                self.seek_and_show(self.pos + 10.0 * step);
+                self.seek_and_show(self.pos + self.settings.seek_step_large * step);
             }
         }
         if key(Key::Home) {
@@ -543,7 +614,7 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Open…").on_hover_text("Open an audio file (Ctrl+O)").clicked() {
+            if ui.button("Open…").on_hover_text("Open an audio file or a playlist (Ctrl+O)").clicked() {
                 self.open_dialog(ui.ctx());
             }
             match (&self.loading, &self.loaded) {
@@ -566,6 +637,9 @@ impl App {
                 if ui.button("?").on_hover_text("Keyboard shortcuts (F1)").clicked() {
                     self.show_help = !self.show_help;
                 }
+                if ui.button("Preferences").on_hover_text("Preferences (Ctrl+,)").clicked() {
+                    self.show_preferences = !self.show_preferences;
+                }
                 for mode in ViewMode::ALL.into_iter().rev() {
                     ui.selectable_value(&mut self.settings.view, mode, mode.label());
                 }
@@ -584,13 +658,11 @@ impl App {
             ui.selectable_value(&mut self.settings.sidebar, SidebarTab::Playlist, RichText::new("Playlist").size(15.0));
         });
         ui.separator();
-        let options_height = 250.0;
-        let list_height = (ui.available_height() - options_height).max(80.0);
+        let list_height = ui.available_height().max(80.0);
         match self.settings.sidebar {
             SidebarTab::Bookmarks => self.bookmark_list(ui, list_height),
             SidebarTab::Playlist => self.playlist(ui, list_height),
         }
-        self.options(ui);
     }
 
     fn playlist(&mut self, ui: &mut Ui, height: f32) {
@@ -636,7 +708,7 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("+ Files…").on_hover_text("Add audio files (or drop several on the window)").clicked() {
+            if ui.button("+ Files…").on_hover_text("Add audio files or playlists (or drop several on the window)").clicked() {
                 self.add_dialog(ui.ctx());
             }
             let current = self.current_path.clone().filter(|p| self.library.playlist().position(Some(p)).is_none());
@@ -647,6 +719,16 @@ impl App {
             {
                 self.add_to_playlist(current.into_iter().collect());
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let enabled = !self.library.playlist().tracks.is_empty();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Export…"))
+                    .on_hover_text("Save this playlist as M3U, PLS or XSPF")
+                    .clicked()
+                {
+                    self.export_dialog(ui.ctx());
+                }
+            });
         });
         ui.add_space(2.0);
 
@@ -658,7 +740,7 @@ impl App {
         let mut action = None;
         let tracks = &self.library.playlist().tracks;
         let current = self.library.playlist().position(self.current_path.as_deref());
-        let list_height = (height - 104.0).max(60.0);
+        let list_height = (height - 82.0).max(60.0);
         egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
             if tracks.is_empty() {
                 ui.weak("This playlist is empty.\nAdd files, or drop several on the window.");
@@ -694,8 +776,6 @@ impl App {
                 });
             }
         });
-        ui.checkbox(&mut self.settings.auto_advance, "Play the next track automatically")
-            .on_hover_text("When a track ends and no loop is on (N / P skip by hand)");
         match action {
             Some(Action::Open(path)) => {
                 self.autoplay = self.playing;
@@ -771,32 +851,110 @@ impl App {
         }
     }
 
-    fn options(&mut self, ui: &mut Ui) {
-        ui.separator();
-        ui.label(RichText::new("Playhead").strong());
-        egui::ComboBox::from_id_salt("follow")
-            .width(ui.available_width() - 8.0)
-            .selected_text(self.settings.follow.label())
-            .show_ui(ui, |ui| {
-                for follow in Follow::ALL {
-                    ui.selectable_value(&mut self.settings.follow, follow, follow.label());
-                }
-            })
-            .response
-            .on_hover_text("How the display keeps up with the playhead while playing");
-        ui.checkbox(&mut self.settings.return_on_pause, "Pause returns to start point")
-            .on_hover_text("When pausing, put the playhead back where playback began");
+    fn preferences_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_preferences;
+        egui::Window::new("Preferences").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            let section = |ui: &mut Ui, title: &str| {
+                ui.add_space(6.0);
+                ui.label(RichText::new(title).strong());
+            };
+            let grid = |ui: &mut Ui, id: &str, contents: &mut dyn FnMut(&mut Ui)| {
+                egui::Grid::new(id).num_columns(2).spacing([16.0, 6.0]).min_col_width(150.0).show(ui, |ui| contents(ui));
+            };
+            let settings = &mut self.settings;
 
-        ui.add_space(6.0);
-        ui.label(RichText::new("Loop").strong());
-        self.loop_combo(ui, ui.available_width() - 8.0);
-        ui.add(egui::Slider::new(&mut self.settings.loop_gap, 0.0..=4.0).step_by(0.25).suffix(" s").text("gap"))
-            .on_hover_text("Silence between loop repeats");
+            ui.label(RichText::new("Playback").strong());
+            let mut keep_pitch = settings.keep_pitch;
+            grid(ui, "playback", &mut |ui| {
+                ui.label("Speed changes");
+                ui.checkbox(&mut keep_pitch, "Keep pitch (time-stretch)")
+                    .on_hover_text("Off: plain resampling like a tape machine, so pitch follows speed");
+                ui.end_row();
+                ui.label("When pausing");
+                ui.checkbox(&mut settings.return_on_pause, "Return to where playback started");
+                ui.end_row();
+                ui.label("When a track ends");
+                ui.checkbox(&mut settings.auto_advance, "Play the next one in the playlist")
+                    .on_hover_text("Unless a loop is on");
+                ui.end_row();
+                ui.label("Gap between loop repeats");
+                ui.add(egui::Slider::new(&mut settings.loop_gap, 0.0..=4.0).step_by(0.25).suffix(" s"));
+                ui.end_row();
+                ui.label("Arrow keys seek");
+                ui.add(egui::Slider::new(&mut settings.seek_step, 0.5..=10.0).step_by(0.5).suffix(" s"));
+                ui.end_row();
+                ui.label("Shift + arrow keys seek");
+                ui.add(egui::Slider::new(&mut settings.seek_step_large, 5.0..=60.0).step_by(5.0).suffix(" s"));
+                ui.end_row();
+            });
 
-        ui.add_space(6.0);
-        ui.label(RichText::new("Spectrogram").strong());
-        ui.add(egui::Slider::new(&mut self.settings.range_db, 30.0..=100.0).step_by(1.0).suffix(" dB").text("range"))
-            .on_hover_text("Dynamic range shown: lower hides quiet detail");
+            section(ui, "Display");
+            grid(ui, "display", &mut |ui| {
+                ui.label("Follow the playhead");
+                egui::ComboBox::from_id_salt("follow").width(190.0).selected_text(settings.follow.label()).show_ui(
+                    ui,
+                    |ui| {
+                        for follow in Follow::ALL {
+                            ui.selectable_value(&mut settings.follow, follow, follow.label());
+                        }
+                    },
+                );
+                ui.end_row();
+                ui.label("Interface size");
+                egui::ComboBox::from_id_salt("scale")
+                    .width(190.0)
+                    .selected_text(format!("{:.0}%", settings.ui_scale * 100.0))
+                    .show_ui(ui, |ui| {
+                        for scale in [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0] {
+                            ui.selectable_value(&mut settings.ui_scale, scale, format!("{:.0}%", scale * 100.0));
+                        }
+                    });
+                ui.end_row();
+            });
+
+            section(ui, "Spectrogram");
+            grid(ui, "spectrogram", &mut |ui| {
+                ui.label("Theme");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("theme").width(190.0).selected_text(settings.theme.label()).show_ui(
+                        ui,
+                        |ui| {
+                            for theme in Theme::ALL {
+                                ui.horizontal(|ui| {
+                                    theme_swatch(ui, theme, 48.0);
+                                    ui.selectable_value(&mut settings.theme, theme, theme.label());
+                                });
+                            }
+                        },
+                    );
+                });
+                ui.end_row();
+                ui.label("");
+                theme_swatch(ui, settings.theme, 200.0);
+                ui.end_row();
+                ui.label("Dynamic range");
+                ui.add(egui::Slider::new(&mut settings.range_db, 30.0..=100.0).step_by(1.0).suffix(" dB"))
+                    .on_hover_text("Lower hides quiet detail");
+                ui.end_row();
+                ui.label("Octave lines");
+                ui.checkbox(&mut settings.octave_lines, "Mark every C across the display");
+                ui.end_row();
+            });
+
+            ui.add_space(10.0);
+            ui.separator();
+            if ui.button("Reset to defaults").clicked() {
+                let defaults = Settings::default();
+                // Not preferences as such: where you are, not how you like it.
+                let keep = (settings.last_dir.take(), settings.sidebar, settings.view, settings.volume, settings.loop_mode);
+                *settings = Settings { last_dir: keep.0, sidebar: keep.1, view: keep.2, volume: keep.3, loop_mode: keep.4, ..defaults };
+                keep_pitch = settings.keep_pitch;
+            }
+            if keep_pitch != self.settings.keep_pitch {
+                self.set_keep_pitch(keep_pitch);
+            }
+        });
+        self.show_preferences = open;
     }
 
     fn loop_combo(&mut self, ui: &mut Ui, width: f32) {
@@ -923,7 +1081,7 @@ impl App {
     fn help_window(&mut self, ctx: &egui::Context) {
         const KEYS: &[(&str, &str)] = &[
             ("Space", "Play / pause"),
-            ("← / →", "Seek 2 s (Shift: 10 s)"),
+            ("← / →", "Seek back / forward (Shift: further)"),
             ("Home", "Back to the start"),
             ("↑ / ↓", "Speed up / slow down by 5%"),
             ("T", "Speed keeps pitch (time-stretch) on / off"),
@@ -938,7 +1096,8 @@ impl App {
             ("F", "Full-screen display"),
             ("+ / −", "Zoom in / out"),
             ("Z", "Zoom out to the whole track"),
-            ("Ctrl+O", "Open a file"),
+            ("Ctrl+O", "Open a file or playlist"),
+            ("Ctrl+,", "Preferences"),
         ];
         const MOUSE: &[(&str, &str)] = &[
             ("Click", "Move the playhead"),
@@ -1024,6 +1183,12 @@ impl eframe::App for App {
         if self.show_help {
             self.help_window(&ctx);
         }
+        if self.show_preferences {
+            self.preferences_window(&ctx);
+        }
+        if ctx.zoom_factor() != self.settings.ui_scale {
+            ctx.set_zoom_factor(self.settings.ui_scale);
+        }
 
         self.follow_playhead(now);
         let region = self.loop_region();
@@ -1058,6 +1223,19 @@ enum Icon {
     Pause,
     Previous,
     Next,
+}
+
+/// A strip showing a spectrogram theme from quiet to loud.
+fn theme_swatch(ui: &mut Ui, theme: Theme, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 14.0), Sense::hover());
+    let steps = 48;
+    for i in 0..steps {
+        let [r, g, b] = theme.colour(i as f32 / (steps - 1) as f32);
+        let x = |k: usize| rect.left() + rect.width() * k as f32 / steps as f32;
+        let cell = Rect::from_x_y_ranges(x(i)..=x(i + 1) + 0.5, rect.y_range());
+        ui.painter().rect_filled(cell, CornerRadius::ZERO, Color32::from_rgb(r, g, b));
+    }
+    ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_white_alpha(60)), egui::StrokeKind::Outside);
 }
 
 /// Absolute form of a path, so playlist entries survive a change of directory.

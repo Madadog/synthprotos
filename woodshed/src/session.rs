@@ -69,6 +69,75 @@ impl LoopMode {
     }
 }
 
+/// Colour scheme of the spectrogram, quietest to loudest.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Theme {
+    #[default]
+    Inferno,
+    Magma,
+    Viridis,
+    Ice,
+    Phosphor,
+    Greyscale,
+    Paper,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 7] =
+        [Theme::Inferno, Theme::Magma, Theme::Viridis, Theme::Ice, Theme::Phosphor, Theme::Greyscale, Theme::Paper];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Inferno => "Inferno",
+            Theme::Magma => "Magma",
+            Theme::Viridis => "Viridis",
+            Theme::Ice => "Ice",
+            Theme::Phosphor => "Phosphor",
+            Theme::Greyscale => "Greyscale",
+            Theme::Paper => "Paper (dark on white)",
+        }
+    }
+
+    /// Evenly spaced colour stops from silence to the loudest level.
+    pub fn stops(self) -> &'static [[u8; 3]] {
+        match self {
+            Theme::Inferno => &[
+                [0, 0, 4], [31, 12, 72], [85, 15, 109], [136, 34, 106], [186, 54, 85], [227, 89, 51], [249, 140, 10],
+                [249, 201, 50], [252, 255, 164],
+            ],
+            Theme::Magma => &[
+                [0, 0, 4], [28, 16, 68], [79, 18, 123], [129, 37, 129], [181, 54, 122], [229, 80, 100],
+                [251, 135, 97], [254, 194, 135], [252, 253, 191],
+            ],
+            Theme::Viridis => &[
+                [68, 1, 84], [71, 44, 122], [59, 81, 139], [44, 113, 142], [33, 144, 141], [39, 173, 129],
+                [92, 200, 99], [170, 220, 50], [253, 231, 37],
+            ],
+            Theme::Ice => &[
+                [0, 0, 0], [8, 16, 60], [16, 48, 120], [24, 90, 170], [40, 140, 200], [90, 190, 220],
+                [160, 225, 235], [215, 243, 247], [255, 255, 255],
+            ],
+            Theme::Phosphor => &[[0, 0, 0], [0, 48, 20], [0, 110, 48], [20, 180, 80], [90, 235, 130], [225, 255, 215]],
+            Theme::Greyscale => &[[0, 0, 0], [255, 255, 255]],
+            Theme::Paper => &[[255, 255, 255], [0, 0, 0]],
+        }
+    }
+
+    /// Whether silence is light, so overlays need dark lines.
+    pub fn is_light(self) -> bool {
+        self == Theme::Paper
+    }
+
+    /// Colour at `t` in 0..=1.
+    pub fn colour(self, t: f32) -> [u8; 3] {
+        let stops = self.stops();
+        let x = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+        let i = (x as usize).min(stops.len() - 2);
+        let f = x - i as f32;
+        std::array::from_fn(|k| (stops[i][k] as f32 + (stops[i + 1][k] as f32 - stops[i][k] as f32) * f).round() as u8)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SidebarTab {
     #[default]
@@ -89,6 +158,14 @@ pub struct Settings {
     pub loop_gap: f64,
     /// Dynamic range shown by the spectrogram, dB.
     pub range_db: f32,
+    pub theme: Theme,
+    /// Faint lines across the spectrogram at every C.
+    pub octave_lines: bool,
+    /// Seconds the arrow keys seek, without and with Shift.
+    pub seek_step: f64,
+    pub seek_step_large: f64,
+    /// Size of the whole interface.
+    pub ui_scale: f32,
     /// Speed changes time-stretch (keeping pitch) rather than resample.
     pub keep_pitch: bool,
     /// When a track ends, play the next one in the playlist.
@@ -107,6 +184,11 @@ impl Default for Settings {
             loop_mode: LoopMode::default(),
             loop_gap: 0.0,
             range_db: 70.0,
+            theme: Theme::default(),
+            octave_lines: true,
+            seek_step: 2.0,
+            seek_step_large: 10.0,
+            ui_scale: 1.0,
             keep_pitch: true,
             auto_advance: true,
             sidebar: SidebarTab::default(),
@@ -240,11 +322,19 @@ impl Library {
 
     /// Add an empty playlist with an unused name and show it.
     pub fn add_playlist(&mut self) {
-        let name = (1..)
-            .map(|n| format!("Playlist {n}"))
-            .find(|name| self.playlists.iter().all(|p| &p.name != name))
+        self.import("Playlist", Vec::new());
+    }
+
+    /// Add a playlist, numbering the name if it is taken, and show it.
+    pub fn import(&mut self, name: &str, tracks: Vec<PathBuf>) {
+        let taken = |name: &str| self.playlists.iter().any(|p| p.name == name);
+        let numbered = name == "Playlist";
+        let name = std::iter::once(name.to_owned())
+            .filter(|_| !numbered)
+            .chain((if numbered { 1 } else { 2 }..).map(|n| format!("{name} {n}")))
+            .find(|candidate| !taken(candidate))
             .unwrap();
-        self.playlists.push(Playlist { name, tracks: Vec::new() });
+        self.playlists.push(Playlist { name, tracks });
         self.current = self.playlists.len() - 1;
     }
 
@@ -337,9 +427,27 @@ mod tests {
         let mut library = Library::default();
         library.add_playlist();
         assert_eq!((library.current, library.playlist().name.as_str()), (1, "Playlist 2"));
+        library.import("Gig", vec![PathBuf::from("a.mp3")]);
+        library.import("Gig", Vec::new());
+        let names: Vec<&str> = library.playlists.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Playlist 1", "Playlist 2", "Gig", "Gig 2"]);
+        library.remove_playlist();
+        library.remove_playlist();
         library.remove_playlist();
         library.remove_playlist();
         assert_eq!((library.playlists.len(), library.current), (1, 0));
+    }
+
+    #[test]
+    fn theme_colours() {
+        for theme in Theme::ALL {
+            let stops = theme.stops();
+            assert_eq!(theme.colour(0.0), stops[0]);
+            assert_eq!(theme.colour(1.0), *stops.last().unwrap());
+            assert_eq!(theme.colour(7.0), *stops.last().unwrap());
+        }
+        assert_eq!(Theme::Greyscale.colour(0.5), [128, 128, 128]);
+        assert!(Theme::Paper.is_light() && !Theme::Inferno.is_light());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use eframe::egui::{
 use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE, PITCH_MAX, PITCH_MIN, ROWS};
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
 use crate::pitch;
-use crate::session::{LoopMode, ViewMode};
+use crate::session::{LoopMode, Theme, ViewMode};
 use crate::track::Track;
 
 const RULER_HEIGHT: f32 = 38.0;
@@ -270,11 +270,13 @@ impl App {
         if let Some(rect) = spec_rect {
             let pitch_axis = PitchAxis::new(&self.view, rect);
             let clipped = content.with_clip_rect(rect);
-            self.tiles.draw(ui.ctx(), &clipped, rect, axis, pitch_axis, &spectrogram, self.settings.range_db, now);
+            let (range, theme) = (self.settings.range_db, self.settings.theme);
+            self.tiles.draw(ui.ctx(), &clipped, rect, axis, pitch_axis, &spectrogram, range, theme, now);
             // Octave lines at every C.
-            for midi in (12..=120).step_by(12) {
+            let grid = if theme.is_light() { Color32::from_black_alpha(40) } else { Color32::from_white_alpha(22) };
+            for midi in (12..=120).step_by(12).filter(|_| self.settings.octave_lines) {
                 let y = pitch_axis.y(midi as f64 - 0.5);
-                clipped.hline(rect.x_range(), y, Stroke::new(1.0, Color32::from_white_alpha(22)));
+                clipped.hline(rect.x_range(), y, Stroke::new(1.0, grid));
             }
             if !spectrogram.is_complete() {
                 clipped.text(
@@ -282,7 +284,7 @@ impl App {
                     Align2::RIGHT_BOTTOM,
                     format!("Analysing… {:.0}%", spectrogram.progress() * 100.0),
                     FontId::proportional(12.0),
-                    Color32::from_white_alpha(170),
+                    if theme.is_light() { Color32::from_black_alpha(170) } else { Color32::from_white_alpha(170) },
                 );
             }
             if let (Some(_), Some(ribbon)) = (wave_rect, ribbon) {
@@ -343,7 +345,10 @@ impl App {
             draw_piano(&painter.with_clip_rect(ribbon), ribbon, PitchAxis::new(&self.view, rect), hover_pitch);
         }
         if let Some(p) = hover.filter(|p| timed.contains(*p)) {
-            let line = Stroke::new(1.0, Color32::from_white_alpha(90));
+            // On a light spectrogram the crosshair needs a dark line.
+            let light = self.settings.theme.is_light() && spec_rect.is_some_and(|r| r.contains(p));
+            let colour = if light { Color32::from_black_alpha(140) } else { Color32::from_white_alpha(90) };
+            let line = Stroke::new(1.0, colour);
             content.vline(p.x, ruler.bottom()..=full.bottom(), line);
             let mut text = format_time(axis.t(p.x), if axis.span < 2.0 { 3 } else { 2 });
             if let Some(midi) = hover_pitch.filter(|_| p.y > ruler.bottom()) {
@@ -509,7 +514,7 @@ struct Tile {
     texture: TextureHandle,
     /// Finished analysis blocks and colour mapping the texture was built from.
     ready: usize,
-    colours: (u8, u32),
+    colours: (u8, u32, Theme),
     built: f64,
     used: u64,
 }
@@ -533,12 +538,13 @@ impl Tiles {
         pitch: PitchAxis,
         spec: &Spectrogram,
         range_db: f32,
+        theme: Theme,
         now: f64,
     ) {
         self.frame += 1;
         let complete = spec.is_complete();
-        let colours = (spec.peak(), range_db as u32);
-        let lut = colour_table(spec.peak(), range_db);
+        let colours = (spec.peak(), range_db as u32, theme);
+        let lut = colour_table(spec.peak(), range_db, theme);
 
         let cols_per_sec = spec.sample_rate as f64 / spec.hop as f64;
         let (c0, c1) = (time.start * cols_per_sec, (time.start + time.span) * cols_per_sec);
@@ -632,28 +638,12 @@ fn build_tile(spec: &Spectrogram, level: u32, index: usize, lut: &[Color32; 256]
 }
 
 /// Map stored levels to colours: the loudest level seen is the top of the
-/// scale and `range_db` below it is black.
-fn colour_table(peak: u8, range_db: f32) -> [Color32; 256] {
-    // An "inferno"-like ramp: black, purple, red, orange, pale yellow.
-    const STOPS: [(f32, [f32; 3]); 9] = [
-        (0.00, [0.0, 0.0, 4.0]),
-        (0.14, [22.0, 11.0, 57.0]),
-        (0.28, [66.0, 10.0, 104.0]),
-        (0.42, [106.0, 23.0, 110.0]),
-        (0.56, [147.0, 38.0, 103.0]),
-        (0.70, [188.0, 55.0, 84.0]),
-        (0.82, [228.0, 90.0, 49.0]),
-        (0.92, [249.0, 142.0, 9.0]),
-        (1.00, [252.0, 250.0, 164.0]),
-    ];
+/// scale and `range_db` below it is the theme's colour for silence.
+fn colour_table(peak: u8, range_db: f32, theme: Theme) -> [Color32; 256] {
     let top = peak.max(1) as f32;
     let span = range_db / DB_RANGE * 255.0;
     std::array::from_fn(|value| {
-        let t = ((value as f32 - (top - span)) / span).clamp(0.0, 1.0);
-        let i = STOPS.iter().rposition(|s| s.0 <= t).unwrap_or(0).min(STOPS.len() - 2);
-        let ((t0, a), (t1, b)) = (STOPS[i], STOPS[i + 1]);
-        let f = (t - t0) / (t1 - t0);
-        let mix = |k: usize| (a[k] + (b[k] - a[k]) * f) as u8;
-        Color32::from_rgb(mix(0), mix(1), mix(2))
+        let [r, g, b] = theme.colour((value as f32 - (top - span)) / span);
+        Color32::from_rgb(r, g, b)
     })
 }

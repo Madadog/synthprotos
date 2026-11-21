@@ -25,6 +25,14 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
   playlist tab, by dropping several on the window, or on the command line.
   `N` and `P` skip between tracks, and the next track starts by itself when
   one ends (unless a loop is on).
+- **Playlist files**: M3U / M3U8, PLS and XSPF. Opening or dropping one adds
+  it as a playlist named after the file, "+ Files…" merges it into the
+  current playlist, and "Export…" writes any of the three formats. Entries
+  that are web streams are skipped.
+- **Spectrogram themes**: Inferno, Magma, Viridis, Ice, Phosphor, Greyscale
+  and Paper (dark on white).
+- **Preferences** (`Ctrl+,`): playback behaviour, seek steps, playhead
+  following, interface size, spectrogram theme and range.
 
 Reads MP3, FLAC, WAV, Ogg Vorbis, AAC/M4A, ALAC, AIFF and CAF.
 
@@ -46,7 +54,7 @@ it has its own `Cargo.lock`.
 | Key | |
 |---|---|
 | `Space` | Play / pause |
-| `←` `→` | Seek 2 s (`Shift`: 10 s) |
+| `←` `→` | Seek back / forward (`Shift`: further; steps set in Preferences) |
 | `Home` | Back to the start |
 | `↑` `↓` | Speed up / slow down by 5% |
 | `T` | Speed keeps pitch (time-stretch) on / off |
@@ -61,7 +69,8 @@ it has its own `Cargo.lock`.
 | `F` | Full-screen display |
 | `+` `-` | Zoom in / out |
 | `Z` | Zoom out to the whole track |
-| `Ctrl+O` | Open a file (or drop one on the window) |
+| `Ctrl+O` | Open a file or playlist (or drop one on the window) |
+| `Ctrl+,` | Preferences |
 
 | Mouse, in the display | |
 |---|---|
@@ -81,6 +90,7 @@ it has its own `Cargo.lock`.
 - `analysis.rs` builds the waveform peak pyramid and, on background threads,
   the spectrogram: three FFT sizes blended onto a grid of four rows per
   semitone, so bass notes are resolved without smearing the treble in time.
+- `playlist_io.rs` reads and writes M3U, PLS and XSPF playlists.
 - `display.rs` draws the zoomable view; the spectrogram is cached as texture
   tiles at power-of-two zoom levels.
 - `app.rs` holds the state, hotkeys, transport bar and bookmark sidebar;
