@@ -112,6 +112,7 @@ impl App {
         let (wave_rect, spec_rect) = match mode {
             ViewMode::Waveform => (Some(body), None),
             ViewMode::Spectrogram => (None, Some(body)),
+            ViewMode::Playlist => (None, None),
             ViewMode::Both => {
                 let split = body.top() + (body.height() * 0.28).clamp(50.0, 240.0);
                 (

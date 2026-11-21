@@ -4,6 +4,7 @@ mod analysis;
 mod app;
 mod display;
 mod engine;
+mod metadata;
 mod pitch;
 mod playlist_io;
 mod session;

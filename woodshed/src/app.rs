@@ -14,6 +14,7 @@ use eframe::egui::{
 use crate::analysis::{Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
 use crate::display::{Drag, Tiles};
 use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
+use crate::metadata::{self, Meta, MetaCache, SortColumn};
 use crate::playlist_io;
 use crate::session::{Follow, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
 use crate::track::{self, Track};
@@ -31,6 +32,13 @@ pub fn format_time(secs: f64, decimals: usize) -> String {
     let minutes = (t / 60.0).floor();
     let width = if decimals == 0 { 2 } else { decimals + 3 };
     format!("{}:{:0width$.decimals$}", minutes as u64, t - minutes * 60.0)
+}
+
+enum PlaylistAction {
+    Open(PathBuf),
+    Remove(usize),
+    Move(usize, usize),
+    Sort(SortColumn),
 }
 
 pub struct Loaded {
@@ -75,6 +83,9 @@ pub struct App {
     /// Start playing as soon as the file being loaded is ready.
     autoplay: bool,
     confirm_delete: bool,
+    meta: MetaCache,
+    /// The column the playlist was last sorted by, and whether ascending.
+    playlist_sort: Option<(SortColumn, bool)>,
     export_dialog: Option<Receiver<Option<PathBuf>>>,
     show_preferences: bool,
 
@@ -121,6 +132,11 @@ impl App {
             current_path: None,
             autoplay: false,
             confirm_delete: false,
+            meta: {
+                let ctx = cc.egui_ctx.clone();
+                MetaCache::new(move || ctx.request_repaint())
+            },
+            playlist_sort: None,
             export_dialog: None,
             show_preferences: false,
             pos: 0.0,
@@ -191,6 +207,7 @@ impl App {
             }
         }
         self.library.playlist_mut().add(tracks);
+        self.playlist_sort = None;
         self.library_dirty = true;
         self.settings.sidebar = SidebarTab::Playlist;
     }
@@ -522,8 +539,9 @@ impl App {
             }
         }
         if key(Key::V) {
-            let i = ViewMode::ALL.iter().position(|&m| m == self.settings.view).unwrap_or(0);
-            self.settings.view = ViewMode::ALL[(i + 1) % ViewMode::ALL.len()];
+            let views = ViewMode::choices(self.settings.playlist_view);
+            let i = views.iter().position(|&m| m == self.settings.view).unwrap_or(0);
+            self.settings.view = views[(i + 1) % views.len()];
         }
         if shift(Key::B) {
             self.add_bookmark(true);
@@ -640,7 +658,7 @@ impl App {
                 if ui.button("Preferences").on_hover_text("Preferences (Ctrl+,)").clicked() {
                     self.show_preferences = !self.show_preferences;
                 }
-                for mode in ViewMode::ALL.into_iter().rev() {
+                for &mode in ViewMode::choices(self.settings.playlist_view).iter().rev() {
                     ui.selectable_value(&mut self.settings.view, mode, mode.label());
                 }
                 ui.weak("View (V)");
@@ -653,19 +671,25 @@ impl App {
 
     fn sidebar(&mut self, ui: &mut Ui) {
         ui.add_space(4.0);
+        // With the playlist as a view of its own, the sidebar is all bookmarks.
+        let tab = if self.settings.playlist_view { SidebarTab::Bookmarks } else { self.settings.sidebar };
         ui.horizontal(|ui| {
+            if self.settings.playlist_view {
+                ui.label(RichText::new("Bookmarks").size(15.0).strong());
+                return;
+            }
             ui.selectable_value(&mut self.settings.sidebar, SidebarTab::Bookmarks, RichText::new("Bookmarks").size(15.0));
             ui.selectable_value(&mut self.settings.sidebar, SidebarTab::Playlist, RichText::new("Playlist").size(15.0));
         });
         ui.separator();
         let list_height = ui.available_height().max(80.0);
-        match self.settings.sidebar {
+        match tab {
             SidebarTab::Bookmarks => self.bookmark_list(ui, list_height),
             SidebarTab::Playlist => self.playlist(ui, list_height),
         }
     }
 
-    fn playlist(&mut self, ui: &mut Ui, height: f32) {
+    fn playlist_controls(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let label = if self.confirm_delete { "Really delete?" } else { "Delete" };
@@ -673,6 +697,7 @@ impl App {
                 if delete.clicked() {
                     if self.confirm_delete || self.library.playlist().tracks.is_empty() {
                         self.library.remove_playlist();
+                        self.playlist_sort = None;
                         self.library_dirty = true;
                         self.confirm_delete = false;
                     } else {
@@ -683,6 +708,7 @@ impl App {
                 }
                 if ui.button("New").on_hover_text("Start a new, empty playlist").clicked() {
                     self.library.add_playlist();
+                    self.playlist_sort = None;
                     self.library_dirty = true;
                 }
                 let mut chosen = self.library.current;
@@ -696,6 +722,7 @@ impl App {
                     });
                 if chosen != self.library.current {
                     self.library.current = chosen;
+                    self.playlist_sort = None;
                     self.library_dirty = true;
                 }
             });
@@ -730,13 +757,12 @@ impl App {
                 }
             });
         });
-        ui.add_space(2.0);
+    }
 
-        enum Action {
-            Open(PathBuf),
-            Remove(usize),
-            Move(usize, usize),
-        }
+    /// The playlist as a compact list, for the sidebar.
+    fn playlist(&mut self, ui: &mut Ui, height: f32) {
+        self.playlist_controls(ui);
+        ui.add_space(2.0);
         let mut action = None;
         let tracks = &self.library.playlist().tracks;
         let current = self.library.playlist().position(self.current_path.as_deref());
@@ -753,13 +779,13 @@ impl App {
                     ui.add_sized([18.0, 18.0], egui::Label::new(number));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("×").on_hover_text("Remove from the playlist").clicked() {
-                            action = Some(Action::Remove(i));
+                            action = Some(PlaylistAction::Remove(i));
                         }
                         if ui.add_enabled(i + 1 < tracks.len(), egui::Button::new(RichText::new("↓").monospace()).small()).clicked() {
-                            action = Some(Action::Move(i, i + 1));
+                            action = Some(PlaylistAction::Move(i, i + 1));
                         }
                         if ui.add_enabled(i > 0, egui::Button::new(RichText::new("↑").monospace()).small()).clicked() {
-                            action = Some(Action::Move(i, i - 1));
+                            action = Some(PlaylistAction::Move(i, i - 1));
                         }
                         let name = path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy();
                         let mut text = RichText::new(name);
@@ -769,23 +795,159 @@ impl App {
                         let row = egui::Button::new(text).frame(false).truncate();
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             if ui.add(row).on_hover_text(path.to_string_lossy()).clicked() {
-                                action = Some(Action::Open(path.clone()));
+                                action = Some(PlaylistAction::Open(path.clone()));
                             }
                         });
                     });
                 });
             }
         });
+        self.apply_playlist_action(action, ui.ctx());
+    }
+
+    fn apply_playlist_action(&mut self, action: Option<PlaylistAction>, ctx: &egui::Context) {
+        let Some(action) = action else { return };
+        let was_sorted = self.playlist_sort.take();
         match action {
-            Some(Action::Open(path)) => {
+            PlaylistAction::Open(path) => {
+                self.playlist_sort = was_sorted;
                 self.autoplay = self.playing;
-                self.open(&path, ui.ctx());
+                self.open(&path, ctx);
+                return;
             }
-            Some(Action::Remove(i)) => drop(self.library.playlist_mut().tracks.remove(i)),
-            Some(Action::Move(from, to)) => self.library.playlist_mut().tracks.swap(from, to),
-            None => return,
+            PlaylistAction::Remove(i) => drop(self.library.playlist_mut().tracks.remove(i)),
+            PlaylistAction::Move(from, to) => self.library.playlist_mut().tracks.swap(from, to),
+            PlaylistAction::Sort(column) => {
+                // A second click on the same column reverses it.
+                let ascending = was_sorted != Some((column, true));
+                let tracks = std::mem::take(&mut self.library.playlist_mut().tracks);
+                let mut entries: Vec<_> = tracks.into_iter().map(|p| (self.meta.get(&p).cloned(), p)).map(|(m, p)| (p, m)).collect();
+                metadata::sort(&mut entries, column, ascending);
+                self.library.playlist_mut().tracks = entries.into_iter().map(|e| e.0).collect();
+                self.playlist_sort = Some((column, ascending));
+            }
         }
         self.library_dirty = true;
+    }
+
+    /// The playlist as a full view: a table with sortable metadata columns.
+    fn playlist_table(&mut self, ui: &mut Ui) {
+        use egui_extras::{Column, TableBuilder};
+        self.meta.poll();
+        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+            ui.scope(|ui| {
+                ui.set_max_width(460.0);
+                self.playlist_controls(ui);
+            });
+            ui.separator();
+
+            let tracks = self.library.playlist().tracks.clone();
+            let metas: Vec<Option<Meta>> = tracks.iter().map(|p| self.meta.get(p).cloned()).collect();
+            let current = self.library.playlist().position(self.current_path.as_deref());
+            let sorted = self.playlist_sort;
+            let mut action = None;
+            if tracks.is_empty() {
+                ui.weak("This playlist is empty. Add files, or drop several on the window.");
+                return;
+            }
+            let text_column = |width: f32| Column::initial(width).at_least(60.0).clip(true);
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .sense(Sense::click())
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::exact(34.0))
+                .column(Column::remainder().at_least(120.0).clip(true))
+                .column(text_column(170.0))
+                .column(text_column(170.0))
+                .column(Column::exact(58.0))
+                .column(Column::exact(64.0))
+                .column(Column::exact(58.0))
+                .column(Column::exact(88.0))
+                .header(24.0, |mut header| {
+                    header.col(|ui| drop(ui.strong("#")));
+                    for (label, column) in [
+                        ("Title", SortColumn::Title),
+                        ("Artist", SortColumn::Artist),
+                        ("Album", SortColumn::Album),
+                        ("Track", SortColumn::TrackNumber),
+                        ("Length", SortColumn::Length),
+                        ("Type", SortColumn::Kind),
+                    ] {
+                        let mut clicked = false;
+                        let (_, cell) = header.col(|ui| {
+                            let button = egui::Button::new(RichText::new(label).strong()).frame(false);
+                            let response = ui.add(button).on_hover_text("Sort the playlist by this column");
+                            clicked = response.clicked();
+                            if let Some((_, ascending)) = sorted.filter(|s| s.0 == column) {
+                                // A small arrow: up for ascending.
+                                let c = response.rect.right_center() + vec2(9.0, 0.0);
+                                let d = if ascending { -3.5 } else { 3.5 };
+                                ui.painter().add(Shape::convex_polygon(
+                                    vec![c + vec2(-4.0, -d), c + vec2(4.0, -d), c + vec2(0.0, d)],
+                                    ACCENT,
+                                    Stroke::NONE,
+                                ));
+                            }
+                        });
+                        // The whole header cell is the target, not just its text.
+                        if clicked || cell.clicked() {
+                            action = Some(PlaylistAction::Sort(column));
+                        }
+                    }
+                    header.col(|_| {});
+                })
+                .body(|body| {
+                    body.rows(24.0, tracks.len(), |mut row| {
+                        let i = row.index();
+                        let (path, meta) = (&tracks[i], metas[i].as_ref());
+                        let playing = current == Some(i);
+                        row.set_selected(playing);
+                        let unreadable = meta.is_some_and(|m| m.unreadable);
+                        let cell = |ui: &mut Ui, text: String| {
+                            let mut text = RichText::new(text);
+                            if unreadable {
+                                text = text.weak();
+                            }
+                            ui.add(egui::Label::new(text).truncate().selectable(false));
+                        };
+                        let optional = |value: Option<&String>| value.cloned().unwrap_or_default();
+                        row.col(|ui| {
+                            let colour = if playing { ACCENT } else { ui.visuals().weak_text_color() };
+                            ui.label(RichText::new(format!("{}", i + 1)).color(colour).monospace());
+                        });
+                        row.col(|ui| cell(ui, metadata::display_title(path, meta)));
+                        row.col(|ui| cell(ui, optional(meta.and_then(|m| m.artist.as_ref()))));
+                        row.col(|ui| cell(ui, optional(meta.and_then(|m| m.album.as_ref()))));
+                        row.col(|ui| cell(ui, meta.and_then(|m| m.track_number).map(|n| n.to_string()).unwrap_or_default()));
+                        row.col(|ui| {
+                            let length = match meta {
+                                None => "…".to_owned(),
+                                Some(m) if m.unreadable => "missing".to_owned(),
+                                Some(m) => m.duration.map(|d| format_time(d, 0)).unwrap_or_default(),
+                            };
+                            cell(ui, length);
+                        });
+                        row.col(|ui| cell(ui, metadata::kind(path)));
+                        row.col(|ui| {
+                            let arrow = |glyph: &str| egui::Button::new(RichText::new(glyph).monospace()).small();
+                            if ui.add_enabled(i > 0, arrow("↑")).on_hover_text("Move up").clicked() {
+                                action = Some(PlaylistAction::Move(i, i - 1));
+                            }
+                            if ui.add_enabled(i + 1 < tracks.len(), arrow("↓")).on_hover_text("Move down").clicked() {
+                                action = Some(PlaylistAction::Move(i, i + 1));
+                            }
+                            if ui.small_button("×").on_hover_text("Remove from the playlist").clicked() {
+                                action = Some(PlaylistAction::Remove(i));
+                            }
+                        });
+                        if row.response().on_hover_text(path.to_string_lossy()).clicked() && action.is_none() {
+                            action = Some(PlaylistAction::Open(path.clone()));
+                        }
+                    });
+                });
+            self.apply_playlist_action(action, ui.ctx());
+        });
     }
 
     fn bookmark_list(&mut self, ui: &mut Ui, height: f32) {
@@ -899,6 +1061,19 @@ impl App {
                         }
                     },
                 );
+                ui.end_row();
+                ui.label("Playlist");
+                let hint = "On: the playlist is a view like the waveform and spectrogram (V cycles to it, F makes \
+                            it full screen), shown as a table with title, artist, album and length columns that \
+                            sort the playlist when clicked.\nOff: a compact list in the sidebar";
+                if ui.checkbox(&mut settings.playlist_view, "Show as a full view with metadata columns").on_hover_text(hint).changed() {
+                    // Show the result of the change straight away.
+                    if settings.playlist_view {
+                        settings.view = ViewMode::Playlist;
+                    } else {
+                        settings.sidebar = SidebarTab::Playlist;
+                    }
+                }
                 ui.end_row();
                 ui.label("Interface size");
                 egui::ComboBox::from_id_salt("scale")
@@ -1092,7 +1267,7 @@ impl App {
             ("L", "Loop on / off"),
             ("I / O", "Set the loop start / end at the playhead"),
             ("Esc", "Leave full screen, or clear the selection"),
-            ("V", "Cycle waveform / spectrogram / both"),
+            ("V", "Cycle waveform / spectrogram / both (and playlist, if a view)"),
             ("F", "Full-screen display"),
             ("+ / −", "Zoom in / out"),
             ("Z", "Zoom out to the whole track"),
@@ -1162,6 +1337,9 @@ impl eframe::App for App {
                 }
             }
         }
+        if self.settings.view == ViewMode::Playlist && !self.settings.playlist_view {
+            self.settings.view = ViewMode::default();
+        }
         self.hotkeys(&ctx);
 
         egui::Panel::bottom("transport").show(ui, |ui| self.transport(ui));
@@ -1174,7 +1352,9 @@ impl eframe::App for App {
             egui::Panel::right("sidebar").default_size(260.0).size_range(200.0..=420.0).show(ui, |ui| self.sidebar(ui));
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            if self.loaded.is_some() && self.loading.is_none() {
+            if self.settings.view == ViewMode::Playlist {
+                self.playlist_table(ui);
+            } else if self.loaded.is_some() && self.loading.is_none() {
                 self.display(ui);
             } else {
                 self.empty_state(ui);

@@ -10,16 +10,23 @@ pub enum ViewMode {
     #[default]
     Spectrogram,
     Both,
+    /// The playlist as a table (when enabled in the preferences).
+    Playlist,
 }
 
 impl ViewMode {
-    pub const ALL: [ViewMode; 3] = [ViewMode::Waveform, ViewMode::Spectrogram, ViewMode::Both];
+    /// The views on offer; the playlist is one only if `playlist_view` is on.
+    pub fn choices(playlist_view: bool) -> &'static [ViewMode] {
+        const ALL: [ViewMode; 4] = [ViewMode::Waveform, ViewMode::Spectrogram, ViewMode::Both, ViewMode::Playlist];
+        &ALL[..if playlist_view { 4 } else { 3 }]
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             ViewMode::Waveform => "Waveform",
             ViewMode::Spectrogram => "Spectrogram",
             ViewMode::Both => "Both",
+            ViewMode::Playlist => "Playlist",
         }
     }
 }
@@ -171,6 +178,9 @@ pub struct Settings {
     /// When a track ends, play the next one in the playlist.
     pub auto_advance: bool,
     pub sidebar: SidebarTab,
+    /// Show the playlist as a full view with metadata columns, instead of
+    /// as a sidebar tab.
+    pub playlist_view: bool,
     pub last_dir: Option<PathBuf>,
 }
 
@@ -192,6 +202,7 @@ impl Default for Settings {
             keep_pitch: true,
             auto_advance: true,
             sidebar: SidebarTab::default(),
+            playlist_view: false,
             last_dir: None,
         }
     }

@@ -29,6 +29,12 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
   it as a playlist named after the file, "+ Files…" merges it into the
   current playlist, and "Export…" writes any of the three formats. Entries
   that are web streams are skipped.
+- **Playlist view** (a toggle in Preferences): the playlist becomes a view
+  alongside waveform and spectrogram, so `V` cycles to it and `F` makes it
+  full screen. It is a table with title, artist, album, track number, length
+  and type read from the files' tags; clicking a column header sorts the
+  playlist by it (again to reverse). Off, the playlist is a compact list in
+  the sidebar.
 - **Spectrogram themes**: Inferno, Magma, Viridis, Ice, Phosphor, Greyscale
   and Paper (dark on white).
 - **Preferences** (`Ctrl+,`): playback behaviour, seek steps, playhead
@@ -91,6 +97,8 @@ it has its own `Cargo.lock`.
   the spectrogram: three FFT sizes blended onto a grid of four rows per
   semitone, so bass notes are resolved without smearing the treble in time.
 - `playlist_io.rs` reads and writes M3U, PLS and XSPF playlists.
+- `metadata.rs` reads tags and durations on a worker thread for the playlist
+  table, and sorts by them.
 - `display.rs` draws the zoomable view; the spectrogram is cached as texture
   tiles at power-of-two zoom levels.
 - `app.rs` holds the state, hotkeys, transport bar and bookmark sidebar;
