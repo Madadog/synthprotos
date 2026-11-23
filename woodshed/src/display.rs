@@ -1,86 +1,216 @@
 //! The zoomable display: time ruler with bookmarks and loop region, waveform,
-//! and the pitch-axis spectrogram with its piano ribbon and hover readout.
+//! and the pitch-axis spectrogram with its piano and hover readout.
+//!
+//! Two layouts share this code. Normally time runs left to right with the
+//! piano as a ribbon down the left. In piano mode the piano lies along the
+//! bottom (low notes on the left) and time runs vertically above it.
 
 use std::collections::HashMap;
 
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, ColorImage, CornerRadius, CursorIcon, FontId, Painter, PointerButton, Pos2,
-    Rect, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui,
+    Rangef, Rect, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui,
 };
 
 use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE, PITCH_MAX, PITCH_MIN, ROWS};
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
 use crate::pitch;
-use crate::session::{LoopMode, Theme, ViewMode};
+use crate::session::{LoopMode, Settings, Theme, ViewMode};
 use crate::track::Track;
 
 const RULER_HEIGHT: f32 = 38.0;
+const RULER_WIDTH: f32 = 76.0;
 const FLAG_HEIGHT: f32 = 15.0;
 const RIBBON_WIDTH: f32 = 54.0;
+const PIANO_HEIGHT: f32 = 68.0;
 const BACKGROUND: Color32 = Color32::from_rgb(14, 14, 18);
 const RULER_BACKGROUND: Color32 = Color32::from_rgb(28, 28, 34);
-const WAVEFORM: Color32 = Color32::from_rgb(120, 172, 232);
-/// Pointer distance within which a selection edge can be grabbed.
+/// Pointer distance within which an edge or divider can be grabbed.
 const GRAB: f32 = 5.0;
 
 /// What a pointer drag in the display is doing.
 pub enum Drag {
     None,
+    /// Dragging the playhead along.
+    Scrub,
     /// Selecting a loop region from `anchor` seconds.
     Select { anchor: f64 },
     /// Moving one edge of the selection.
     Edge { start: bool },
     /// Moving a bookmark.
     Bookmark { id: u64 },
-    /// Panning time (and pitch).
+    /// Panning time and pitch.
     Pan,
-    /// Panning the pitch axis from the piano ribbon.
-    Pitch,
+    /// Playing notes on the piano.
+    Piano,
+    /// Resizing the waveform / spectrogram split.
+    Divider,
 }
 
-/// Maps time to x within the content area.
+/// A linear map from a value range to screen coordinates along one direction.
+/// `length` is signed, so the axis can run either way.
 #[derive(Clone, Copy)]
-struct TimeAxis {
-    left: f32,
-    width: f32,
-    start: f64,
-    span: f64,
-}
-
-impl TimeAxis {
-    fn new(view: &View, left: f32, width: f32) -> Self {
-        TimeAxis { left, width, start: view.start, span: view.span }
-    }
-
-    fn x(&self, t: f64) -> f32 {
-        self.left + ((t - self.start) / self.span) as f32 * self.width
-    }
-
-    fn t(&self, x: f32) -> f64 {
-        self.start + ((x - self.left) / self.width) as f64 * self.span
-    }
-}
-
-/// Maps MIDI pitch to y within the spectrogram.
-#[derive(Clone, Copy)]
-struct PitchAxis {
-    top: f32,
-    height: f32,
+struct Axis {
+    origin: f32,
+    length: f32,
     lo: f64,
     hi: f64,
 }
 
-impl PitchAxis {
-    fn new(view: &View, rect: Rect) -> Self {
-        PitchAxis { top: rect.top(), height: rect.height(), lo: view.pitch_lo, hi: view.pitch_hi }
+impl Axis {
+    fn at(&self, value: f64) -> f32 {
+        self.origin + ((value - self.lo) / (self.hi - self.lo)) as f32 * self.length
     }
 
-    fn y(&self, pitch: f64) -> f32 {
-        self.top + ((self.hi - pitch) / (self.hi - self.lo)) as f32 * self.height
+    fn value(&self, coord: f32) -> f64 {
+        self.lo + ((coord - self.origin) / self.length) as f64 * (self.hi - self.lo)
     }
 
-    fn pitch(&self, y: f32) -> f64 {
-        self.hi - ((y - self.top) / self.height) as f64 * (self.hi - self.lo)
+    fn size(&self) -> f32 {
+        self.length.abs()
+    }
+
+    /// Screen distance per unit of value, signed.
+    fn scale(&self) -> f64 {
+        self.length as f64 / (self.hi - self.lo)
+    }
+}
+
+/// Where everything is, for one frame.
+#[derive(Clone, Copy)]
+struct Geometry {
+    /// Time runs vertically (piano mode).
+    vertical: bool,
+    time: Axis,
+    pitch: Option<Axis>,
+    ruler: Rect,
+    /// Waveform and spectrogram together.
+    body: Rect,
+    wave: Option<Rect>,
+    spec: Option<Rect>,
+    piano: Option<Rect>,
+    /// Ruler and body: everything with a time coordinate.
+    timed: Rect,
+}
+
+impl Geometry {
+    fn new(full: Rect, settings: &Settings, view: &View) -> Geometry {
+        let mode = settings.view;
+        let has_spec = mode != ViewMode::Waveform;
+        let vertical = settings.piano_mode && has_spec;
+        let split = if mode == ViewMode::Both { settings.split.clamp(0.1, 0.8) } else { 0.0 };
+        let (ruler, body, piano);
+        if vertical {
+            let bottom = full.bottom() - PIANO_HEIGHT;
+            ruler = Rect::from_min_max(full.min, pos2(full.left() + RULER_WIDTH, bottom));
+            body = Rect::from_min_max(pos2(ruler.right(), full.top()), pos2(full.right(), bottom));
+        } else {
+            let left = full.left() + if has_spec { RIBBON_WIDTH } else { 0.0 };
+            ruler = Rect::from_min_max(pos2(left, full.top()), pos2(full.right(), full.top() + RULER_HEIGHT));
+            body = Rect::from_min_max(pos2(left, ruler.bottom()), full.max);
+        }
+        // The waveform takes the first `split` of the body, across the time axis.
+        let cut = if vertical { body.left() + body.width() * split } else { body.top() + body.height() * split };
+        let (first, second) = if vertical {
+            (Rect::from_min_max(body.min, pos2(cut, body.bottom())), Rect::from_min_max(pos2(cut + 1.0, body.top()), body.max))
+        } else {
+            (Rect::from_min_max(body.min, pos2(body.right(), cut)), Rect::from_min_max(pos2(body.left(), cut + 1.0), body.max))
+        };
+        let (wave, spec) = match mode {
+            ViewMode::Waveform => (Some(body), None),
+            ViewMode::Both => (Some(first), Some(second)),
+            _ => (None, Some(body)),
+        };
+        piano = spec.map(|s| {
+            if vertical {
+                Rect::from_min_max(pos2(s.left(), s.bottom()), pos2(s.right(), full.bottom()))
+            } else {
+                Rect::from_min_max(pos2(full.left(), s.top()), pos2(body.left(), s.bottom()))
+            }
+        });
+        let (lo, hi) = (view.start, view.start + view.span);
+        let time = if !vertical {
+            Axis { origin: body.left(), length: body.width().max(10.0), lo, hi }
+        } else if settings.reverse {
+            // The past rises from the piano: later is lower.
+            Axis { origin: body.top(), length: body.height().max(10.0), lo, hi }
+        } else {
+            // What is coming falls towards the piano: later is higher.
+            Axis { origin: body.bottom(), length: -body.height().max(10.0), lo, hi }
+        };
+        let pitch = spec.map(|s| {
+            let (lo, hi) = (view.pitch_lo, view.pitch_hi);
+            if vertical {
+                Axis { origin: s.left(), length: s.width(), lo, hi }
+            } else {
+                Axis { origin: s.bottom(), length: -s.height(), lo, hi }
+            }
+        });
+        Geometry { vertical, time, pitch, ruler, body, wave, spec, piano, timed: ruler.union(body) }
+    }
+
+    /// Coordinate along the time axis.
+    fn along(&self, p: Pos2) -> f32 {
+        if self.vertical { p.y } else { p.x }
+    }
+
+    /// Coordinate across the time axis (the pitch direction).
+    fn across(&self, p: Pos2) -> f32 {
+        if self.vertical { p.x } else { p.y }
+    }
+
+    fn point(&self, along: f32, across: f32) -> Pos2 {
+        if self.vertical { pos2(across, along) } else { pos2(along, across) }
+    }
+
+    fn along_range(&self, rect: Rect) -> Rangef {
+        if self.vertical { rect.y_range() } else { rect.x_range() }
+    }
+
+    fn across_range(&self, rect: Rect) -> Rangef {
+        if self.vertical { rect.x_range() } else { rect.y_range() }
+    }
+
+    fn time_at(&self, p: Pos2) -> f64 {
+        self.time.value(self.along(p))
+    }
+
+    fn pitch_at(&self, p: Pos2) -> Option<f64> {
+        Some(self.pitch?.value(self.across(p)))
+    }
+
+    /// A line at one moment in time, spanning `across`.
+    fn time_line(&self, painter: &Painter, along: f32, across: impl Into<Rangef>, stroke: impl Into<Stroke>) {
+        if self.vertical {
+            painter.hline(across, along, stroke);
+        } else {
+            painter.vline(along, across, stroke);
+        }
+    }
+
+    /// A line at one pitch (or amplitude), spanning `along` in time.
+    fn cross_line(&self, painter: &Painter, across: f32, along: impl Into<Rangef>, stroke: impl Into<Stroke>) {
+        if self.vertical {
+            painter.vline(across, along, stroke);
+        } else {
+            painter.hline(along, across, stroke);
+        }
+    }
+
+    /// The rectangle between two time coordinates, spanning `across`.
+    fn band(&self, a: f32, b: f32, across: Rangef) -> Rect {
+        let along = Rangef::new(a.min(b), a.max(b));
+        if self.vertical { Rect::from_x_y_ranges(across, along) } else { Rect::from_x_y_ranges(along, across) }
+    }
+
+    /// The divider between waveform and spectrogram, as a grab area.
+    fn divider(&self) -> Option<Rect> {
+        let (wave, _) = (self.wave?, self.spec?);
+        Some(if self.vertical {
+            Rect::from_x_y_ranges(wave.right() - GRAB..=wave.right() + GRAB + 1.0, wave.y_range())
+        } else {
+            Rect::from_x_y_ranges(wave.x_range(), wave.bottom() - GRAB..=wave.bottom() + GRAB + 1.0)
+        })
     }
 }
 
@@ -92,83 +222,90 @@ struct Flag {
 }
 
 impl App {
+    /// Whether the display currently runs time vertically (piano mode).
+    pub fn vertical(&self) -> bool {
+        self.settings.piano_mode && self.settings.view != ViewMode::Waveform
+    }
+
+    /// Ctrl+click: place a loop point. The first click starts a region, the
+    /// second completes it; after that, clicks move whichever end is nearer.
+    fn place_loop_point(&mut self, t: f64) {
+        match (self.session.selection, self.loop_anchor.take()) {
+            (Some((a, b)), _) => {
+                let (a, b) = if (t - a).abs() < (t - b).abs() { (t, b) } else { (a, t) };
+                self.session.selection = Some((a.min(b), a.max(b)));
+            }
+            (None, Some(anchor)) if anchor != t => {
+                self.session.selection = Some((anchor.min(t), anchor.max(t)));
+            }
+            (None, _) => {
+                self.loop_anchor = Some(t);
+                return;
+            }
+        }
+        self.settings.loop_mode = LoopMode::Selection;
+        self.touch_session();
+    }
+
     pub fn display(&mut self, ui: &mut Ui) {
         let Some(loaded) = &self.loaded else { return };
         let (track, peaks, spectrogram) = (loaded.track.clone(), loaded.peaks.clone(), loaded.spectrogram.clone());
         let duration = track.duration();
         let now = ui.input(|i| i.time);
 
-        // ------------------------------------------------------- layout
         let full = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(full, Sense::click_and_drag());
         let painter = ui.painter_at(full);
         painter.rect_filled(full, CornerRadius::ZERO, BACKGROUND);
 
-        let mode = self.settings.view;
-        let left = full.left() + if mode == ViewMode::Waveform { 0.0 } else { RIBBON_WIDTH };
-        let width = (full.right() - left).max(10.0);
-        let ruler = Rect::from_min_max(pos2(left, full.top()), pos2(full.right(), full.top() + RULER_HEIGHT));
-        let body = Rect::from_min_max(pos2(left, ruler.bottom()), full.max);
-        let (wave_rect, spec_rect) = match mode {
-            ViewMode::Waveform => (Some(body), None),
-            ViewMode::Spectrogram => (None, Some(body)),
-            ViewMode::Playlist => (None, None),
-            ViewMode::Both => {
-                let split = body.top() + (body.height() * 0.28).clamp(50.0, 240.0);
-                (
-                    Some(Rect::from_min_max(body.min, pos2(body.right(), split))),
-                    Some(Rect::from_min_max(pos2(body.left(), split + 1.0), body.max)),
-                )
-            }
-        };
-        let ribbon = spec_rect.map(|r| Rect::from_min_max(pos2(full.left(), r.top()), pos2(left, r.bottom())));
-        let timed = Rect::from_min_max(ruler.min, full.max); // everything with a time axis
-
         // -------------------------------------------------------- input
-        let axis = TimeAxis::new(&self.view, left, width);
-        let flags = self.flags(&painter, axis, ruler);
+        let g = Geometry::new(full, &self.settings, &self.view);
+        let flags = self.flags(&painter, &g);
         let flag_at = |p: Pos2| flags.iter().rev().find(|f| f.rect.contains(p)).map(|f| (f.id, f.time));
         let edge_at = |p: Pos2, selection: Option<(f64, f64)>| {
             let (a, b) = selection?;
-            if !timed.contains(p) {
+            if !g.timed.contains(p) {
                 return None;
             }
-            let (da, db) = ((axis.x(a) - p.x).abs(), (axis.x(b) - p.x).abs());
+            let (da, db) = ((g.time.at(a) - g.along(p)).abs(), (g.time.at(b) - g.along(p)).abs());
             (da.min(db) <= GRAB).then_some(da < db)
         };
+        let over_piano = |p: Pos2| g.piano.is_some_and(|r| r.contains(p));
+        let over_divider = |p: Pos2| g.divider().is_some_and(|r| r.contains(p));
         let hover = response.hover_pos();
+        let pointer = response.interact_pointer_pos();
+        let (origin, primary, ctrl) =
+            ui.input(|i| (i.pointer.press_origin(), i.pointer.button_down(PointerButton::Primary), i.modifiers.command));
 
         if response.drag_started() {
-            let origin = ui.input(|i| i.pointer.press_origin()).or(hover).unwrap_or(full.center());
-            let primary = ui.input(|i| i.pointer.button_down(PointerButton::Primary));
+            let origin = origin.or(hover).unwrap_or(full.center());
             self.drag = if !primary {
                 Drag::Pan
-            } else if ribbon.is_some_and(|r| r.contains(origin)) {
-                Drag::Pitch
+            } else if over_piano(origin) {
+                Drag::Piano
+            } else if over_divider(origin) {
+                Drag::Divider
             } else if let Some((id, _)) = flag_at(origin) {
                 Drag::Bookmark { id }
             } else if let Some(start) = edge_at(origin, self.session.selection) {
                 Drag::Edge { start }
-            } else if timed.contains(origin) {
-                Drag::Select { anchor: axis.t(origin.x).clamp(0.0, duration) }
-            } else {
+            } else if !g.timed.contains(origin) {
                 Drag::None
+            } else if ctrl {
+                Drag::Select { anchor: g.time_at(origin).clamp(0.0, duration) }
+            } else {
+                Drag::Scrub
             };
         }
         if response.dragged() {
             let delta = response.drag_delta();
-            let t = response.interact_pointer_pos().map(|p| axis.t(p.x).clamp(0.0, duration));
-            let pan_pitch = |view: &mut View, rect: Option<Rect>| {
-                if let Some(rect) = rect {
-                    let shift = (delta.y / rect.height()) as f64 * (view.pitch_hi - view.pitch_lo);
-                    view.pitch_lo += shift;
-                    view.pitch_hi += shift;
-                }
-            };
+            let t = pointer.map(|p| g.time_at(p).clamp(0.0, duration));
             match (&mut self.drag, t) {
+                (Drag::Scrub, Some(t)) => self.seek(t),
                 (Drag::Select { anchor }, Some(t)) => {
                     self.session.selection = Some((anchor.min(t), anchor.max(t)));
                     self.settings.loop_mode = LoopMode::Selection;
+                    self.loop_anchor = None;
                     self.touch_session();
                 }
                 (Drag::Edge { start }, Some(t)) => {
@@ -189,111 +326,148 @@ impl App {
                     self.touch_session();
                 }
                 (Drag::Pan, _) => {
-                    self.view.start -= (delta.x / width) as f64 * self.view.span;
-                    pan_pitch(&mut self.view, spec_rect);
+                    self.view.start -= g.along(delta.to_pos2()) as f64 / g.time.scale();
+                    if let Some(pitch) = g.pitch {
+                        let shift = g.across(delta.to_pos2()) as f64 / pitch.scale();
+                        self.view.pitch_lo -= shift;
+                        self.view.pitch_hi -= shift;
+                    }
                     self.last_pan = now;
                 }
-                (Drag::Pitch, _) => pan_pitch(&mut self.view, spec_rect),
+                (Drag::Divider, _) => {
+                    if let Some(p) = pointer {
+                        let range = g.across_range(g.body);
+                        self.settings.split = ((g.across(p) - range.min) / range.span()).clamp(0.1, 0.8);
+                    }
+                }
                 _ => {}
             }
         }
         if response.drag_stopped() {
             if let (Drag::Select { .. }, Some((a, b))) = (&self.drag, self.session.selection) {
-                if axis.x(b) - axis.x(a) < 3.0 {
+                if (g.time.at(b) - g.time.at(a)).abs() < 3.0 {
                     self.session.selection = None;
                 }
             }
             self.drag = Drag::None;
         }
-        if let Some(p) = response.interact_pointer_pos().filter(|_| response.clicked()) {
-            if let Some((_, time)) = flag_at(p) {
+        if let Some(p) = pointer.filter(|_| response.clicked()) {
+            if over_piano(p) || over_divider(p) {
+                // Handled as a note, or nothing.
+            } else if let Some((_, time)) = flag_at(p) {
                 self.seek(time);
-            } else if timed.contains(p) {
-                self.seek(axis.t(p.x));
+            } else if g.timed.contains(p) {
+                let t = g.time_at(p).clamp(0.0, duration);
+                if ctrl {
+                    self.place_loop_point(t);
+                } else {
+                    self.seek(t);
+                }
             }
         }
         if let Some((id, _)) = hover.filter(|_| response.double_clicked()).and_then(flag_at) {
             self.focus_label = Some(id);
         }
 
+        // A key held on the piano sounds for as long as the button is down.
+        let key_down = pointer
+            .filter(|_| primary && response.is_pointer_button_down_on() && origin.is_some_and(over_piano))
+            .and_then(|p| g.pitch_at(p))
+            .map(|pitch| pitch.round() as i32);
+        if key_down != self.sounding {
+            self.sounding = key_down;
+            self.set_tone(key_down.map(|midi| pitch::midi_to_freq(midi as f64)));
+        }
+
         if let Some(p) = hover {
             let (scroll, pinch, alt) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta() as f64, i.modifiers.alt));
-            let over_ribbon = ribbon.is_some_and(|r| r.contains(p));
-            let pitch_axis = spec_rect.map(|r| PitchAxis::new(&self.view, r));
             let zoom_pitch = |view: &mut View, factor: f64| {
-                if let Some(pa) = pitch_axis {
-                    let anchor = pa.pitch(p.y);
+                if let Some(anchor) = g.pitch_at(p) {
                     view.pitch_lo = anchor - (anchor - view.pitch_lo) * factor;
                     view.pitch_hi = anchor + (view.pitch_hi - anchor) * factor;
                 }
             };
             let wheel = (-scroll.y as f64 * 0.004).exp();
-            if over_ribbon {
-                if let Some(pa) = pitch_axis {
-                    let shift = (scroll.y / pa.height) as f64 * (pa.hi - pa.lo);
+            if over_piano(p) {
+                if let Some(pitch) = g.pitch {
+                    // The wheel moves towards higher notes; sideways scrolling drags the keys.
+                    let shift = (scroll.y - scroll.x * pitch.length.signum()) as f64 / pitch.scale().abs();
                     self.view.pitch_lo += shift;
                     self.view.pitch_hi += shift;
                 }
                 zoom_pitch(&mut self.view, 1.0 / pinch);
-            } else if alt && spec_rect.is_some_and(|r| r.contains(p)) {
+            } else if alt && g.spec.is_some_and(|r| r.contains(p)) {
                 zoom_pitch(&mut self.view, wheel);
             } else {
                 if scroll.y != 0.0 || pinch != 1.0 {
-                    self.zoom_time(wheel / pinch, axis.t(p.x.max(left)));
+                    self.zoom_time(wheel / pinch, g.time_at(p).clamp(self.view.start, self.view.start + self.view.span));
                 }
                 if scroll.x != 0.0 {
-                    self.view.start -= (scroll.x / width) as f64 * self.view.span;
+                    self.view.start -= scroll.x as f64 / g.time.scale().abs();
                     self.last_pan = now;
                 }
             }
             // Cursor hints.
-            if !over_ribbon {
-                if flag_at(p).is_some() {
-                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                } else if edge_at(p, self.session.selection).is_some() {
-                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                }
+            let (resize_time, resize_split) = if g.vertical {
+                (CursorIcon::ResizeVertical, CursorIcon::ResizeHorizontal)
+            } else {
+                (CursorIcon::ResizeHorizontal, CursorIcon::ResizeVertical)
+            };
+            match self.drag {
+                Drag::Edge { .. } => ui.ctx().set_cursor_icon(resize_time),
+                Drag::Divider => ui.ctx().set_cursor_icon(resize_split),
+                Drag::Bookmark { .. } | Drag::Pan => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
+                Drag::None if over_piano(p) => ui.ctx().set_cursor_icon(CursorIcon::PointingHand),
+                Drag::None if over_divider(p) => ui.ctx().set_cursor_icon(resize_split),
+                Drag::None if flag_at(p).is_some() => ui.ctx().set_cursor_icon(CursorIcon::PointingHand),
+                Drag::None if edge_at(p, self.session.selection).is_some() => ui.ctx().set_cursor_icon(resize_time),
+                _ => {}
             }
-        }
-        match self.drag {
-            Drag::Edge { .. } => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
-            Drag::Bookmark { .. } | Drag::Pan | Drag::Pitch => ui.ctx().set_cursor_icon(CursorIcon::Grabbing),
-            _ => {}
         }
         self.clamp_view();
 
         // ------------------------------------------------------ drawing
-        let axis = TimeAxis::new(&self.view, left, width);
-        let content = painter.with_clip_rect(timed);
-        if let Some(rect) = wave_rect {
-            draw_waveform(&content.with_clip_rect(rect), rect, axis, &track, &peaks);
+        let g = Geometry::new(full, &self.settings, &self.view);
+        let content = painter.with_clip_rect(g.timed);
+        let theme = self.settings.theme;
+        if let Some(rect) = g.wave {
+            draw_waveform(&content.with_clip_rect(rect), rect, &g, &track, &peaks, &self.settings);
         }
-        if let Some(rect) = spec_rect {
-            let pitch_axis = PitchAxis::new(&self.view, rect);
+        if let (Some(rect), Some(pitch)) = (g.spec, g.pitch) {
             let clipped = content.with_clip_rect(rect);
-            let (range, theme) = (self.settings.range_db, self.settings.theme);
-            self.tiles.draw(ui.ctx(), &clipped, rect, axis, pitch_axis, &spectrogram, range, theme, now);
-            // Octave lines at every C.
-            let grid = if theme.is_light() { Color32::from_black_alpha(40) } else { Color32::from_white_alpha(22) };
+            self.tiles.draw(ui.ctx(), &clipped, &g, &spectrogram, &self.settings, now);
+            let grid = |alpha: u8| {
+                if theme.is_light() { Color32::from_black_alpha(alpha * 2) } else { Color32::from_white_alpha(alpha) }
+            };
+            let along = g.along_range(rect);
+            let key_size = pitch.scale().abs() as f32;
+            if self.settings.semitone_lines && key_size >= 5.0 {
+                for midi in pitch.lo.floor() as i32..=pitch.hi.ceil() as i32 {
+                    g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(9)));
+                }
+            }
             for midi in (12..=120).step_by(12).filter(|_| self.settings.octave_lines) {
-                let y = pitch_axis.y(midi as f64 - 0.5);
-                clipped.hline(rect.x_range(), y, Stroke::new(1.0, grid));
+                g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(22)));
             }
             if !spectrogram.is_complete() {
                 clipped.text(
-                    rect.right_bottom() - vec2(8.0, 6.0),
-                    Align2::RIGHT_BOTTOM,
+                    rect.right_top() + vec2(-8.0, 6.0),
+                    Align2::RIGHT_TOP,
                     format!("Analysing… {:.0}%", spectrogram.progress() * 100.0),
                     FontId::proportional(12.0),
-                    if theme.is_light() { Color32::from_black_alpha(170) } else { Color32::from_white_alpha(170) },
+                    grid(85),
                 );
             }
-            if let (Some(_), Some(ribbon)) = (wave_rect, ribbon) {
-                painter.hline(full.x_range(), ribbon.top() - 0.5, Stroke::new(1.0, RULER_BACKGROUND));
-            }
+        }
+        if let Some(divider) = g.divider() {
+            let hot = matches!(self.drag, Drag::Divider) || hover.is_some_and(|p| divider.contains(p));
+            let colour = if hot { Color32::from_white_alpha(120) } else { RULER_BACKGROUND };
+            let centre = g.across(divider.center());
+            g.cross_line(&painter, centre, g.along_range(divider), Stroke::new(if hot { 2.0 } else { 1.0 }, colour));
         }
 
         // Selection and active loop region.
+        let across = g.across_range(g.body);
         let active = match self.settings.loop_mode {
             LoopMode::Off => None,
             LoopMode::Selection => self.session.selection,
@@ -301,60 +475,83 @@ impl App {
             LoopMode::Track => Some((0.0, duration)),
         };
         if let Some((a, b)) = self.session.selection.filter(|s| Some(*s) != active) {
-            let band = Rect::from_x_y_ranges(axis.x(a)..=axis.x(b), body.y_range());
+            let band = g.band(g.time.at(a), g.time.at(b), across);
             content.rect_filled(band, CornerRadius::ZERO, Color32::from_white_alpha(10));
             content.rect_stroke(band, CornerRadius::ZERO, Stroke::new(1.0, Color32::from_white_alpha(50)), StrokeKind::Inside);
         }
-        painter.rect_filled(ruler, CornerRadius::ZERO, RULER_BACKGROUND);
+        painter.rect_filled(g.ruler, CornerRadius::ZERO, RULER_BACKGROUND);
+        // The edge of the ruler that meets the body, and the direction away from it.
+        let (ruler_edge, outward) = if g.vertical { (g.ruler.right(), -1.0) } else { (g.ruler.bottom(), -1.0) };
+        let ruler_strip = |depth: f32| Rangef::new(ruler_edge + outward * depth, ruler_edge);
         if let Some((a, b)) = active {
-            let (xa, xb) = (axis.x(a), axis.x(b));
-            content.rect_filled(Rect::from_x_y_ranges(xa..=xb, body.y_range()), CornerRadius::ZERO, LOOP.gamma_multiply(0.13));
-            for x in [xa, xb] {
-                content.vline(x, body.y_range(), Stroke::new(1.0, LOOP.gamma_multiply(0.8)));
+            let (ca, cb) = (g.time.at(a), g.time.at(b));
+            content.rect_filled(g.band(ca, cb, across), CornerRadius::ZERO, LOOP.gamma_multiply(0.13));
+            for c in [ca, cb] {
+                g.time_line(&content, c, across, Stroke::new(1.0, LOOP.gamma_multiply(0.8)));
             }
-            let bar = Rect::from_x_y_ranges(xa..=xb, ruler.bottom() - 4.0..=ruler.bottom());
-            content.rect_filled(bar, CornerRadius::ZERO, LOOP);
+            content.rect_filled(g.band(ca, cb, ruler_strip(4.0)), CornerRadius::ZERO, LOOP);
+        }
+        if let Some(anchor) = self.loop_anchor {
+            // A loop start waiting for its end.
+            let c = g.time.at(anchor);
+            g.time_line(&content, c, across, Stroke::new(1.5, LOOP));
+            content.rect_filled(g.band(c - 1.5, c + 1.5, ruler_strip(10.0)), CornerRadius::ZERO, LOOP);
         }
 
-        draw_ruler_ticks(&content, ruler, axis, duration);
+        draw_ruler_ticks(&content, &g, duration);
 
-        // Bookmarks: a flag in the ruler and a line down the display.
-        for flag in self.flags(&painter, axis, ruler) {
-            let x = flag.rect.left();
-            content.vline(x, flag.rect.bottom()..=ruler.bottom(), Stroke::new(1.0, BOOKMARK));
-            content.vline(x, body.y_range(), Stroke::new(1.0, BOOKMARK.gamma_multiply(0.45)));
+        // Bookmarks: a flag in the ruler and a line across the display.
+        let ruler_across = g.across_range(g.ruler);
+        for flag in self.flags(&painter, &g) {
+            let c = g.time.at(flag.time);
+            g.time_line(&content, c, ruler_across, Stroke::new(1.0, BOOKMARK));
+            g.time_line(&content, c, across, Stroke::new(1.0, BOOKMARK.gamma_multiply(0.45)));
             content.rect_filled(flag.rect, CornerRadius { nw: 0, ne: 3, sw: 0, se: 3 }, BOOKMARK);
-            content.galley(flag.rect.min + vec2(4.0, 1.0), flag.galley, Color32::BLACK);
+            content.with_clip_rect(flag.rect).galley(flag.rect.min + vec2(4.0, 1.0), flag.galley, Color32::BLACK);
         }
 
-        // Playhead.
-        let x = axis.x(self.pos);
-        if (left - 1.0..=full.right() + 1.0).contains(&x) {
-            content.vline(x, ruler.top() + FLAG_HEIGHT + 2.0..=full.bottom(), Stroke::new(1.5, ACCENT));
-            let tip = pos2(x, ruler.bottom() - 1.0);
-            content.add(Shape::convex_polygon(
-                vec![tip + vec2(-5.0, -8.0), tip + vec2(5.0, -8.0), tip],
-                ACCENT,
-                Stroke::NONE,
-            ));
+        // Playhead: a line across everything and a marker in the ruler.
+        let c = g.time.at(self.pos);
+        let time_range = g.along_range(g.body);
+        if (time_range.min - 1.0..=time_range.max + 1.0).contains(&c) {
+            let from = if g.vertical { g.ruler.left() + 4.0 } else { g.ruler.top() + FLAG_HEIGHT + 2.0 };
+            // Keep the line visible when the playhead sits on the very edge.
+            let line = c.clamp(time_range.min + 0.75, time_range.max - 0.75);
+            g.time_line(&content, line, Rangef::new(from, across.max), Stroke::new(1.5, ACCENT));
+            let tip = g.point(c, ruler_edge - 1.0);
+            let (back, side) = (g.point(0.0, -8.0).to_vec2(), g.point(5.0, 0.0).to_vec2());
+            content.add(Shape::convex_polygon(vec![tip + back - side, tip + back + side, tip], ACCENT, Stroke::NONE));
         }
 
-        let hover = hover.filter(|_| matches!(self.drag, Drag::None | Drag::Select { .. }));
-        let hover_pitch = hover.zip(spec_rect).filter(|(p, r)| r.contains(*p) || ribbon.is_some_and(|rb| rb.contains(*p)));
-        let hover_pitch = hover_pitch.map(|(p, r)| PitchAxis::new(&self.view, r).pitch(p.y));
-        if let (Some(rect), Some(ribbon)) = (spec_rect, ribbon) {
-            draw_piano(&painter.with_clip_rect(ribbon), ribbon, PitchAxis::new(&self.view, rect), hover_pitch);
+        // Piano, hover crosshair and readout.
+        let hover = hover.filter(|_| matches!(self.drag, Drag::None | Drag::Select { .. } | Drag::Scrub | Drag::Piano));
+        let on_pitch = |p: &Pos2| g.spec.is_some_and(|r| r.contains(*p)) || over_piano(*p);
+        let hover_pitch = hover.filter(on_pitch).and_then(|p| g.pitch_at(p));
+        if let (Some(rect), Some(pitch)) = (g.piano, g.pitch) {
+            draw_piano(&painter.with_clip_rect(rect), rect, pitch, g.vertical, hover_pitch, self.sounding);
         }
-        if let Some(p) = hover.filter(|p| timed.contains(*p)) {
+        if let Some(p) = hover.filter(|p| g.timed.contains(*p)) {
             // On a light spectrogram the crosshair needs a dark line.
-            let light = self.settings.theme.is_light() && spec_rect.is_some_and(|r| r.contains(p));
+            let in_spec = g.spec.is_some_and(|r| r.contains(p));
+            let light = theme.is_light() && in_spec;
             let colour = if light { Color32::from_black_alpha(140) } else { Color32::from_white_alpha(90) };
             let line = Stroke::new(1.0, colour);
-            content.vline(p.x, ruler.bottom()..=full.bottom(), line);
-            let mut text = format_time(axis.t(p.x), if axis.span < 2.0 { 3 } else { 2 });
-            if let Some(midi) = hover_pitch.filter(|_| p.y > ruler.bottom()) {
-                content.hline(left..=full.right(), p.y, line);
+            g.time_line(&content, g.along(p), across, line);
+            let mut text = format_time(g.time_at(p), if self.view.span < 2.0 { 3 } else { 2 });
+            if let (Some(midi), Some(rect), Some(pitch)) = (hover_pitch.filter(|_| in_spec), g.spec, g.pitch) {
+                let along = g.along_range(rect);
+                g.cross_line(&content, g.across(p), along, line);
                 text = format!("{}   {:.1} Hz\n{text}", pitch::describe(midi), pitch::midi_to_freq(midi));
+                if self.settings.harmonics {
+                    // Where the overtones of this pitch would lie.
+                    let clipped = content.with_clip_rect(rect);
+                    for n in 2..=8 {
+                        let c = pitch.at(midi + 12.0 * (n as f64).log2());
+                        g.cross_line(&clipped, c, along, Stroke::new(1.0, colour.gamma_multiply(0.55)));
+                        let at = g.point(g.along(p) + if g.vertical { -10.0 } else { 12.0 }, c);
+                        clipped.text(at, Align2::CENTER_CENTER, format!("{n}"), FontId::monospace(10.0), colour);
+                    }
+                }
             }
             let galley = painter.layout_no_wrap(text, FontId::monospace(12.0), Color32::WHITE);
             let size = galley.size() + vec2(12.0, 8.0);
@@ -362,7 +559,7 @@ impl App {
             if corner.x + size.x > full.right() {
                 corner.x = p.x - size.x - 14.0;
             }
-            corner.y = corner.y.max(ruler.bottom() + 2.0);
+            corner.y = corner.y.max(g.body.top() + 2.0);
             let bubble = Rect::from_min_size(corner, size);
             painter.rect_filled(bubble, CornerRadius::same(4), Color32::from_black_alpha(215));
             painter.rect_stroke(bubble, CornerRadius::same(4), Stroke::new(1.0, Color32::from_white_alpha(40)), StrokeKind::Inside);
@@ -370,7 +567,7 @@ impl App {
         }
     }
 
-    fn flags(&self, painter: &Painter, axis: TimeAxis, ruler: Rect) -> Vec<Flag> {
+    fn flags(&self, painter: &Painter, g: &Geometry) -> Vec<Flag> {
         self.session
             .bookmarks
             .iter()
@@ -380,128 +577,186 @@ impl App {
                     label.push('…');
                 }
                 let galley = painter.layout_no_wrap(label, FontId::proportional(11.0), Color32::BLACK);
-                let min = pos2(axis.x(bookmark.time), ruler.top() + 1.0);
-                let rect = Rect::from_min_size(min, vec2(galley.size().x + 8.0, FLAG_HEIGHT));
+                let c = g.time.at(bookmark.time);
+                let width = galley.size().x + 8.0;
+                let rect = if g.vertical {
+                    // Sitting on the bookmark's line, at the outer side of the ruler.
+                    let width = width.min(g.ruler.width() - 6.0);
+                    Rect::from_min_size(pos2(g.ruler.left() + 1.0, c - FLAG_HEIGHT), vec2(width, FLAG_HEIGHT))
+                } else {
+                    Rect::from_min_size(pos2(c, g.ruler.top() + 1.0), vec2(width, FLAG_HEIGHT))
+                };
                 Flag { id: bookmark.id, time: bookmark.time, rect, galley }
             })
             .collect()
     }
 }
 
-fn draw_ruler_ticks(painter: &Painter, ruler: Rect, axis: TimeAxis, duration: f64) {
+fn draw_ruler_ticks(painter: &Painter, g: &Geometry, duration: f64) {
     const STEPS: [f64; 20] = [
         0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
         600.0, 1800.0,
     ];
-    let per_point = axis.span / axis.width as f64;
-    let step = STEPS.into_iter().find(|s| s / per_point >= 80.0).unwrap_or(3600.0);
+    let axis = g.time;
+    let per_point = (axis.hi - axis.lo) / axis.size() as f64;
+    let spacing = if g.vertical { 44.0 } else { 80.0 };
+    let step = STEPS.into_iter().find(|s| s / per_point >= spacing).unwrap_or(3600.0);
     let decimals = STEPS.iter().position(|&s| s == step).map_or(0, |i| 3usize.saturating_sub(i / 3));
     let minor = step / 5.0;
     let colour = Color32::from_white_alpha(150);
-    let first = (axis.start / minor).floor() as i64;
-    let last = ((axis.start + axis.span).min(duration) / minor).ceil() as i64;
+    let edge = if g.vertical { g.ruler.right() } else { g.ruler.bottom() };
+    let first = (axis.lo / minor).floor() as i64;
+    let last = (axis.hi.min(duration) / minor).ceil() as i64;
     for i in first.max(0)..=last {
-        let x = axis.x(i as f64 * minor);
+        let c = axis.at(i as f64 * minor);
         let major = i % 5 == 0;
-        let top = ruler.bottom() - if major { 9.0 } else { 4.0 };
-        painter.vline(x, top..=ruler.bottom(), Stroke::new(1.0, colour.gamma_multiply(if major { 1.0 } else { 0.5 })));
+        let length = if major { 9.0 } else { 4.0 };
+        let stroke = Stroke::new(1.0, colour.gamma_multiply(if major { 1.0 } else { 0.5 }));
+        g.time_line(painter, c, Rangef::new(edge - length, edge), stroke);
         if major {
-            painter.text(
-                pos2(x + 3.0, ruler.bottom() - 6.0),
-                Align2::LEFT_BOTTOM,
-                format_time(i as f64 * minor, decimals),
-                FontId::monospace(10.5),
-                colour,
-            );
+            let text = format_time(i as f64 * minor, decimals);
+            let (at, align) = if g.vertical {
+                (pos2(edge - 12.0, c), Align2::RIGHT_CENTER)
+            } else {
+                (pos2(c + 3.0, edge - 6.0), Align2::LEFT_BOTTOM)
+            };
+            painter.text(at, align, text, FontId::monospace(10.5), colour);
         }
     }
 }
 
-fn draw_waveform(painter: &Painter, rect: Rect, axis: TimeAxis, track: &Track, peaks: &Peaks) {
-    let mid = rect.center().y;
-    let amp = rect.height() * 0.47;
-    painter.hline(rect.x_range(), mid, Stroke::new(1.0, Color32::from_white_alpha(30)));
+fn draw_waveform(painter: &Painter, rect: Rect, g: &Geometry, track: &Track, peaks: &Peaks, settings: &Settings) {
+    let across = g.across_range(rect);
+    let along = g.along_range(rect);
+    let mid = across.center();
+    // Positive samples go up, or to the right when time is vertical.
+    let amp = across.span() * 0.47 * if g.vertical { 1.0 } else { -1.0 };
+    let zoom = settings.wave_zoom.max(0.1);
+    let log = settings.wave_log;
+    let level = move |sample: f32| -> f32 {
+        let v = sample * zoom;
+        // On the decibel scale, 60 dB below full scale is the centre line.
+        let v = if log { v.signum() * (1.0 + 20.0 * v.abs().max(1e-6).log10() / 60.0).max(0.0) } else { v };
+        mid + v.clamp(-1.05, 1.05) * amp
+    };
+    if settings.wave_centre_line {
+        g.cross_line(painter, mid, along, Stroke::new(1.0, Color32::from_white_alpha(30)));
+    }
+    let [r, green, b] = settings.wave_colour;
+    let colour = Color32::from_rgb(r, green, b);
     let sr = track.sample_rate as f64;
-    let frames_per_point = axis.span * sr / axis.width as f64;
+    let axis = g.time;
+    let frames_per_point = (axis.hi - axis.lo) * sr / axis.size() as f64;
     if frames_per_point < 0.5 {
         // Zoomed in to individual samples: join them up.
-        let first = (axis.start * sr).floor() as i64;
-        let last = ((axis.start + axis.span) * sr).ceil() as i64;
-        let points: Vec<Pos2> =
-            (first..=last).map(|f| pos2(axis.x(f as f64 / sr), mid - track.mono(f) * amp)).collect();
+        let first = (axis.lo * sr).floor() as i64;
+        let last = (axis.hi * sr).ceil() as i64;
+        let points: Vec<Pos2> = (first..=last).map(|f| g.point(axis.at(f as f64 / sr), level(track.mono(f)))).collect();
         if frames_per_point < 0.12 {
             for p in &points {
-                painter.circle_filled(*p, 2.0, WAVEFORM);
+                painter.circle_filled(*p, 2.0, colour);
             }
         }
-        painter.line(points, Stroke::new(1.5, WAVEFORM));
+        painter.line(points, Stroke::new(1.5, colour));
         return;
     }
-    let stroke = Stroke::new(1.0, WAVEFORM);
-    let columns = rect.width().ceil() as usize;
-    for i in 0..columns {
-        let x = rect.left() + i as f32;
-        let (a, b) = (axis.t(x) * sr, axis.t(x + 1.0) * sr);
+    let stroke = Stroke::new(1.0, colour);
+    for i in 0..along.span().ceil() as usize {
+        let c = along.min + i as f32;
+        let (t0, t1) = (axis.value(c), axis.value(c + 1.0));
+        let (a, b) = (t0.min(t1) * sr, t0.max(t1) * sr);
         if b < 0.0 || a >= track.frames() as f64 {
             continue;
         }
         let (lo, hi) = peaks.range(track, a, b);
-        let (top, bottom) = (mid - hi * amp, mid - lo * amp);
-        painter.vline(x + 0.5, top.min(bottom - 1.0)..=bottom, stroke);
+        let (x, y) = (level(lo), level(hi));
+        let (from, to) = (x.min(y), x.max(y).max(x.min(y) + 1.0));
+        g.time_line(painter, c + 0.5, Rangef::new(from, to), stroke);
     }
 }
 
-/// The piano ribbon: one row per semitone, black keys short, every C labelled.
-fn draw_piano(painter: &Painter, rect: Rect, axis: PitchAxis, hover: Option<f64>) {
+/// The piano: one equal strip per semitone, black keys short, every C
+/// labelled. `along_bottom` lays it out left to right for piano mode;
+/// otherwise it is a ribbon running bottom to top.
+fn draw_piano(painter: &Painter, rect: Rect, axis: Axis, along_bottom: bool, hover: Option<f64>, sounding: Option<i32>) {
     const WHITE: Color32 = Color32::from_rgb(232, 232, 226);
     const BLACK: Color32 = Color32::from_rgb(24, 24, 28);
     const LINE: Color32 = Color32::from_rgb(120, 120, 120);
     painter.rect_filled(rect, CornerRadius::ZERO, WHITE);
-    let key_height = axis.height / (axis.hi - axis.lo) as f32;
+    let key_size = axis.scale().abs() as f32;
     let hovered = hover.map(|p| p.round() as i32);
-    for midi in (axis.lo - 1.0).floor() as i32..=(axis.hi + 1.0).ceil() as i32 {
-        let (top, bottom) = (axis.y(midi as f64 + 0.5), axis.y(midi as f64 - 0.5));
-        let row = Rect::from_x_y_ranges(rect.x_range(), top..=bottom);
-        // Outside the 88 keys of a piano (A0..C8) the ribbon is greyed out.
+    // A key's strip, shortened to `depth` of the way from the playing surface's far end.
+    let strip = |midi: i32, depth: f32| {
+        let (a, b) = (axis.at(midi as f64 - 0.5), axis.at(midi as f64 + 0.5));
+        let keys = Rangef::new(a.min(b), a.max(b));
+        if along_bottom {
+            Rect::from_x_y_ranges(keys, rect.top()..=rect.top() + rect.height() * depth)
+        } else {
+            Rect::from_x_y_ranges(rect.left()..=rect.left() + rect.width() * depth, keys)
+        }
+    };
+    let line = |from: Pos2, to: Pos2| painter.line_segment([from, to], Stroke::new(1.0, LINE));
+    let label = |midi: i32, size: f32, colour: Color32| {
+        let key = strip(midi, 1.0);
+        let (at, align) = if along_bottom {
+            (pos2(key.center().x, rect.bottom() - 3.0), Align2::CENTER_BOTTOM)
+        } else {
+            (pos2(rect.right() - 3.0, key.center().y), Align2::RIGHT_CENTER)
+        };
+        painter.text(at, align, pitch::note_name(midi), FontId::proportional(size), colour);
+    };
+    let (low, high) = ((axis.lo - 1.0).floor() as i32, (axis.hi + 1.0).ceil() as i32);
+    for midi in low..=high {
+        let key = strip(midi, 1.0);
+        // Outside the 88 keys of a piano (A0..C8) the keyboard is greyed out.
         if !(21..=108).contains(&midi) {
-            painter.rect_filled(row, CornerRadius::ZERO, Color32::from_rgb(150, 150, 150));
+            painter.rect_filled(key, CornerRadius::ZERO, Color32::from_rgb(150, 150, 150));
         }
         let class = midi.rem_euclid(12);
         if pitch::is_black_key(midi) {
-            let key = Rect::from_min_max(row.min, pos2(rect.left() + rect.width() * 0.6, bottom));
-            painter.rect_filled(key, CornerRadius { nw: 0, ne: 2, sw: 0, se: 2 }, BLACK);
+            let short = strip(midi, 0.6);
+            let corners = if along_bottom {
+                CornerRadius { nw: 0, ne: 0, sw: 2, se: 2 }
+            } else {
+                CornerRadius { nw: 0, ne: 2, sw: 0, se: 2 }
+            };
+            painter.rect_filled(short, corners, BLACK);
             // The gap between the white keys either side runs on from the black key.
-            painter.hline(key.right()..=rect.right(), row.center().y, Stroke::new(1.0, LINE));
+            if along_bottom {
+                line(short.center_bottom(), key.center_bottom());
+            } else {
+                line(short.right_center(), key.right_center());
+            }
         } else if class == 0 || class == 5 {
             // B|C and E|F: white keys meeting with no black key between.
-            painter.hline(rect.x_range(), bottom, Stroke::new(1.0, LINE));
+            if along_bottom {
+                line(key.left_top(), key.left_bottom());
+            } else {
+                line(key.left_bottom(), key.right_bottom());
+            }
         }
-        if hovered == Some(midi) {
-            painter.rect_filled(row, CornerRadius::ZERO, ACCENT.gamma_multiply(0.75));
-        }
-        if class == 0 {
-            let size = (key_height * 1.5).clamp(9.0, 12.0);
-            painter.text(
-                pos2(rect.right() - 3.0, row.center().y),
-                Align2::RIGHT_CENTER,
-                pitch::note_name(midi),
-                FontId::proportional(size),
-                Color32::from_rgb(40, 40, 40),
-            );
+        if sounding == Some(midi) {
+            painter.rect_filled(key, CornerRadius::ZERO, ACCENT);
+        } else if hovered == Some(midi) {
+            painter.rect_filled(key, CornerRadius::ZERO, ACCENT.gamma_multiply(0.6));
         }
     }
-    if let Some(midi) = hovered.filter(|m| m.rem_euclid(12) != 0) {
-        // Name the hovered key too.
-        let y = axis.y(midi as f64);
-        painter.text(
-            pos2(rect.right() - 3.0, y),
-            Align2::RIGHT_CENTER,
-            pitch::note_name(midi),
-            FontId::proportional(11.0),
-            Color32::BLACK,
-        );
+    // Labels last, so neighbouring keys do not paint over them.
+    let named = sounding.or(hovered).filter(|m| m.rem_euclid(12) != 0);
+    // Along the bottom, a C's label gives way to the named key beside it.
+    let crowded = |midi: i32| along_bottom && named.is_some_and(|n| (n - midi).abs() <= 2);
+    for midi in (low..=high).filter(|m| m.rem_euclid(12) == 0 && !crowded(*m)) {
+        let size = if along_bottom { 10.5 } else { (key_size * 1.5).clamp(9.0, 12.0) };
+        label(midi, size, Color32::from_rgb(40, 40, 40));
     }
-    painter.vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, Color32::BLACK));
+    if let Some(midi) = named {
+        label(midi, 11.0, Color32::BLACK);
+    }
+    if along_bottom {
+        painter.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, Color32::BLACK));
+    } else {
+        painter.vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, Color32::BLACK));
+    }
 }
 
 // --------------------------------------------------------------- tiles
@@ -511,11 +766,21 @@ const TILE: usize = 1024;
 const MAX_TILES: usize = 40;
 const MAX_LEVEL: u32 = 12;
 
+/// Everything that decides a tile's pixels besides the analysis itself.
+#[derive(Clone, Copy, PartialEq)]
+struct Look {
+    peak: u8,
+    range_db: u32,
+    brightness_db: i32,
+    theme: Theme,
+    smooth: bool,
+}
+
 struct Tile {
     texture: TextureHandle,
-    /// Finished analysis blocks and colour mapping the texture was built from.
+    /// Finished analysis blocks and look the texture was built from.
     ready: usize,
-    colours: (u8, u32, Theme),
+    look: Look,
     built: f64,
     used: u64,
 }
@@ -529,32 +794,35 @@ pub struct Tiles {
 }
 
 impl Tiles {
-    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         ctx: &egui::Context,
         painter: &Painter,
-        rect: Rect,
-        time: TimeAxis,
-        pitch: PitchAxis,
+        g: &Geometry,
         spec: &Spectrogram,
-        range_db: f32,
-        theme: Theme,
+        settings: &Settings,
         now: f64,
     ) {
+        let (Some(pitch), time) = (g.pitch, g.time) else { return };
         self.frame += 1;
         let complete = spec.is_complete();
-        let colours = (spec.peak(), range_db as u32, theme);
-        let lut = colour_table(spec.peak(), range_db, theme);
+        let look = Look {
+            peak: spec.peak(),
+            range_db: settings.range_db as u32,
+            brightness_db: settings.brightness_db as i32,
+            theme: settings.theme,
+            smooth: settings.smooth,
+        };
+        let lut = colour_table(&look);
+        let options = if look.smooth { TextureOptions::LINEAR } else { TextureOptions::NEAREST };
 
         let cols_per_sec = spec.sample_rate as f64 / spec.hop as f64;
-        let (c0, c1) = (time.start * cols_per_sec, (time.start + time.span) * cols_per_sec);
-        let cols_per_pixel = (c1 - c0) / (rect.width() * ctx.pixels_per_point()) as f64;
+        let (c0, c1) = (time.lo * cols_per_sec, time.hi * cols_per_sec);
+        let cols_per_pixel = (c1 - c0) / (time.size() * ctx.pixels_per_point()) as f64;
         let level = (cols_per_pixel.log2().floor().max(0.0) as u32).min(MAX_LEVEL);
         let tile_cols = TILE << level;
 
         let v = |p: f64| ((PITCH_MAX - p) / (PITCH_MAX - PITCH_MIN)) as f32;
-        let uv_y = v(pitch.hi)..=v(pitch.lo);
         let mut budget = 2;
         let first = (c0.max(0.0) as usize) / tile_cols;
         let last = ((c1.max(0.0) as usize) / tile_cols).min((spec.cols - 1) / tile_cols);
@@ -567,7 +835,7 @@ impl Tiles {
                 None => true,
                 Some(t) => {
                     // While analysis runs, refresh partial tiles a few times a second.
-                    (t.ready != ready || t.colours != colours) && (complete || now - t.built > 0.35)
+                    (t.ready != ready || t.look != look) && (complete || now - t.built > 0.35)
                 }
             };
             if stale && budget > 0 && (ready > 0 || tile.is_none()) {
@@ -576,13 +844,13 @@ impl Tiles {
                 let tile = Tile {
                     texture: match self.tiles.remove(&(level, index)) {
                         Some(mut old) => {
-                            old.texture.set(image, TextureOptions::LINEAR);
+                            old.texture.set(image, options);
                             old.texture
                         }
-                        None => ctx.load_texture(format!("spectrogram-{level}-{index}"), image, TextureOptions::LINEAR),
+                        None => ctx.load_texture(format!("spectrogram-{level}-{index}"), image, options),
                     },
                     ready,
-                    colours,
+                    look,
                     built: now,
                     used: self.frame,
                 };
@@ -593,14 +861,21 @@ impl Tiles {
             }
             if let Some(tile) = self.tiles.get_mut(&(level, index)) {
                 tile.used = self.frame;
-                // Column c is centred on frame c * hop.
-                let x = |col: usize| time.x((col as f64 - 0.5) / cols_per_sec);
-                painter.image(
-                    tile.texture.id(),
-                    Rect::from_x_y_ranges(x(a)..=x(b), rect.y_range()),
-                    Rect::from_x_y_ranges(0.0..=1.0, uv_y.clone()),
-                    Color32::WHITE,
-                );
+                // Column c is centred on frame c * hop. The texture has time
+                // along u and pitch along v, whichever way the display runs.
+                let along = |col: usize| time.at((col as f64 - 0.5) / cols_per_sec);
+                let mut mesh = egui::Mesh::with_texture(tile.texture.id());
+                for (col, u) in [(a, 0.0), (b, 1.0)] {
+                    for p in [pitch.lo, pitch.hi] {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: g.point(along(col), pitch.at(p)),
+                            uv: pos2(u, v(p)),
+                            color: Color32::WHITE,
+                        });
+                    }
+                }
+                mesh.indices.extend([0, 1, 2, 1, 3, 2]);
+                painter.add(Shape::mesh(mesh));
             }
         }
         if self.tiles.len() > MAX_TILES {
@@ -638,13 +913,15 @@ fn build_tile(spec: &Spectrogram, level: u32, index: usize, lut: &[Color32; 256]
     ColorImage::new([TILE, ROWS], pixels)
 }
 
-/// Map stored levels to colours: the loudest level seen is the top of the
-/// scale and `range_db` below it is the theme's colour for silence.
-fn colour_table(peak: u8, range_db: f32, theme: Theme) -> [Color32; 256] {
-    let top = peak.max(1) as f32;
-    let span = range_db / DB_RANGE * 255.0;
+/// Map stored levels to colours: the loudest level seen (lowered by the
+/// brightness setting) is the top of the scale, and `range_db` below that is
+/// the theme's colour for silence.
+fn colour_table(look: &Look) -> [Color32; 256] {
+    let per_db = 255.0 / DB_RANGE;
+    let top = look.peak.max(1) as f32 - look.brightness_db as f32 * per_db;
+    let span = look.range_db as f32 * per_db;
     std::array::from_fn(|value| {
-        let [r, g, b] = theme.colour((value as f32 - (top - span)) / span);
+        let [r, g, b] = look.theme.colour((value as f32 - (top - span)) / span);
         Color32::from_rgb(r, g, b)
     })
 }

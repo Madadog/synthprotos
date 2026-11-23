@@ -9,12 +9,25 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
 - **Spectrogram with a pitch axis**: a piano ribbon down the left with every
   C labelled by octave; hovering shows the note, cents offset and frequency
   under the cursor.
+- **Piano mode**: lays the piano along the bottom, low notes on the left,
+  with the spectrogram above it and time running vertically. With playhead
+  following on, the playhead stays on the piano's edge, so the notes about to
+  sound fall onto their keys; "Reverse direction" instead shows what has
+  just been played rising from the keys.
+- **Reference tones**: click or drag on the piano to hear a sine tone at
+  that note.
+- **Display settings** fold out at the bottom of the sidebar. Spectrogram:
+  theme, range, brightness, smoothing, octave and semitone lines, and
+  markers for the harmonics of the pitch under the cursor. Waveform: zoom,
+  decibel scale, centre line and colour. In the "Both" view, drag the
+  divider to resize waveform against spectrogram.
 - **Full-song seek bar** in the usual place, which also shows the bookmarks,
   the loop, and the stretch the zoomed display is looking at.
 - **Loops**: a dragged selection, the section between two bookmarks, or the
   whole track, with an optional gap between repeats.
 - **Playhead options**: the display can page along, keep the playhead
-  centred, or stay put; pausing can return to where playback started.
+  centred, or stay put; with "Return" ticked beside the play button,
+  pausing goes back to where playback started.
 - **Labelled bookmarks**: `B` drops one at the playhead, `[` and `]` skip
   between them, `1`–`9` jump straight to one. Bookmarks, the loop selection
   and speed are remembered per file.
@@ -80,8 +93,11 @@ it has its own `Cargo.lock`.
 
 | Mouse, in the display | |
 |---|---|
-| Click | Move the playhead |
-| Drag | Select a loop region; drag its edges to adjust |
+| Click or drag | Move the playhead |
+| `Ctrl`+click | Place loop points: start, then end; after that, move the nearer one |
+| `Ctrl`+drag | Select a loop region; drag its edges to adjust |
+| Click the piano | Play that note |
+| Drag the divider | Resize waveform against spectrogram |
 | Right-drag | Pan |
 | Scroll | Zoom the timeline (`Shift`: pan) |
 | `Alt`+scroll | Zoom the pitch axis |

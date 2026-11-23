@@ -53,6 +53,13 @@ pub struct Engine {
     hist: [[f32; 2]; 4],
     frac: f64,
     fade: f32,
+
+    // Reference tone played from the piano.
+    tone: Option<f64>,
+    tone_freq: f64,
+    tone_phase: f64,
+    tone_level: f32,
+    tone_volume: f32,
 }
 
 impl Engine {
@@ -80,6 +87,11 @@ impl Engine {
             hist: [[0.0; 2]; 4],
             frac: 1.0,
             fade: 0.0,
+            tone: None,
+            tone_freq: 440.0,
+            tone_phase: 0.0,
+            tone_level: 0.0,
+            tone_volume: 0.5,
         }
     }
 
@@ -315,35 +327,47 @@ impl Engine {
     /// Fill an interleaved output buffer at the device rate.
     pub fn render(&mut self, out: &mut [f32], channels: usize) {
         out.fill(0.0);
-        let Some(track) = self.track.clone() else { return };
+        let track = self.track.clone();
         // Without time-stretching, speed is applied here by resampling.
-        let ratio = track.sample_rate as f64 / self.out_rate * (self.speed / self.stretch());
+        let ratio = track.as_ref().map_or(1.0, |t| t.sample_rate as f64 / self.out_rate) * (self.speed / self.stretch());
         let fade_step = (1.0 / (0.008 * self.out_rate)) as f32;
         for frame in out.chunks_mut(channels.max(1)) {
+            let mut s = [0.0f32; 2];
             if self.playing {
                 self.fade = (self.fade + fade_step).min(1.0);
-            } else if self.fade > 0.0 {
-                self.fade = (self.fade - fade_step).max(0.0);
             } else {
-                break;
+                self.fade = (self.fade - fade_step).max(0.0);
             }
-            while self.frac >= 1.0 {
-                self.hist.copy_within(1.., 0);
-                self.hist[3] = self.next_frame(&track);
-                self.frac -= 1.0;
+            if let Some(track) = track.as_ref().filter(|_| self.fade > 0.0) {
+                while self.frac >= 1.0 {
+                    self.hist.copy_within(1.., 0);
+                    self.hist[3] = self.next_frame(track);
+                    self.frac -= 1.0;
+                }
+                let t = self.frac as f32;
+                let gain = self.fade * self.volume;
+                for (ch, s) in s.iter_mut().enumerate() {
+                    let [y0, y1, y2, y3] = self.hist.map(|f| f[ch]);
+                    // 4-point Catmull-Rom interpolation between y1 and y2.
+                    let c1 = 0.5 * (y2 - y0);
+                    let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+                    let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+                    *s = (((c3 * t + c2) * t + c1) * t + y1) * gain;
+                }
+                self.frac += ratio;
             }
-            let t = self.frac as f32;
-            let gain = self.fade * self.volume;
-            let mut s = [0.0f32; 2];
-            for (ch, s) in s.iter_mut().enumerate() {
-                let [y0, y1, y2, y3] = self.hist.map(|f| f[ch]);
-                // 4-point Catmull-Rom interpolation between y1 and y2.
-                let c1 = 0.5 * (y2 - y0);
-                let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
-                let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-                *s = (((c3 * t + c2) * t + c1) * t + y1) * gain;
+            // The reference tone, with a short fade either side to avoid clicks.
+            let target = if self.tone.is_some() { 1.0 } else { 0.0 };
+            if self.tone_level != target || target > 0.0 {
+                self.tone_level += (target - self.tone_level).clamp(-fade_step, fade_step);
+                if let Some(freq) = self.tone {
+                    self.tone_freq = freq;
+                }
+                self.tone_phase = (self.tone_phase + self.tone_freq / self.out_rate).fract();
+                let tone = (self.tone_phase * std::f64::consts::TAU).sin() as f32 * self.tone_level * self.tone_volume;
+                s[0] += tone;
+                s[1] += tone;
             }
-            self.frac += ratio;
             match frame {
                 [m] => *m = (s[0] + s[1]) * 0.5,
                 [l, r, ..] => {
@@ -353,6 +377,12 @@ impl Engine {
                 [] => {}
             }
         }
+    }
+
+    /// Sound a sine tone at `freq` Hz until called again with `None`.
+    pub fn set_tone(&mut self, freq: Option<f64>, volume: f32) {
+        self.tone = freq;
+        self.tone_volume = volume.clamp(0.0, 1.0);
     }
 }
 
@@ -546,6 +576,25 @@ mod tests {
         let out = render(&mut e, 2 * SR as usize);
         assert!((zero_crossing_freq(&out[4800..]) - 220.0).abs() < 0.5);
         assert!((e.position() - 1.0).abs() < 0.05, "position {}", e.position());
+    }
+
+    #[test]
+    fn tone_sounds_without_a_track_and_fades_out() {
+        let mut e = Engine::new();
+        e.set_output_rate(SR);
+        e.set_tone(Some(440.0), 0.5);
+        let out = render(&mut e, SR as usize / 2);
+        let body = &out[4800..];
+        assert!((zero_crossing_freq(body) - 440.0).abs() < 0.5);
+        let peak = body.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
+        // A change of note keeps the waveform continuous.
+        e.set_tone(Some(880.0), 0.5);
+        let next = render(&mut e, 480);
+        assert!((next[0] - out[out.len() - 1]).abs() < 0.06);
+        e.set_tone(None, 0.5);
+        let tail = render(&mut e, SR as usize / 10);
+        assert!(tail[4000..].iter().all(|x| *x == 0.0));
     }
 
     #[test]

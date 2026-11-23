@@ -104,6 +104,12 @@ pub struct App {
     show_help: bool,
     /// Bookmark whose label should grab keyboard focus.
     pub focus_label: Option<u64>,
+    /// A loop start placed with Ctrl+click, waiting for its end.
+    pub loop_anchor: Option<f64>,
+    /// The piano key being played with the mouse.
+    pub sounding: Option<i32>,
+    /// Height of the sidebar's display settings on the last frame.
+    settings_height: f32,
 }
 
 impl App {
@@ -149,6 +155,9 @@ impl App {
             fullscreen: false,
             show_help: false,
             focus_label: None,
+            loop_anchor: None,
+            sounding: None,
+            settings_height: 60.0,
         };
         app.open_files(files, &cc.egui_ctx);
         app
@@ -362,6 +371,7 @@ impl App {
                 self.pos = 0.0;
                 self.cue = 0.0;
                 self.drag = Drag::None;
+                self.loop_anchor = None;
                 self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram });
             }
         }
@@ -400,7 +410,9 @@ impl App {
     /// Seek from outside the zoomed display, scrolling it to show the playhead.
     fn seek_and_show(&mut self, secs: f64) {
         self.seek(secs);
-        if self.pos < self.view.start || self.pos > self.view.start + self.view.span {
+        if self.vertical() && self.settings.follow != Follow::Off {
+            self.align_to_piano();
+        } else if self.pos < self.view.start || self.pos > self.view.start + self.view.span {
             self.view.start = self.pos - self.view.span * 0.2;
             self.clamp_view();
         }
@@ -472,10 +484,26 @@ impl App {
 
     // --------------------------------------------------------------- view
 
+    /// In piano mode: put the playhead on the edge of the piano, so what is
+    /// coming falls onto the keys (or, reversed, what was played rises from them).
+    fn align_to_piano(&mut self) {
+        self.view.start = if self.settings.reverse { self.pos - self.view.span } else { self.pos };
+        self.clamp_view();
+    }
+
+    pub fn set_tone(&mut self, freq: Option<f64>) {
+        self.engine.lock().unwrap().set_tone(freq, self.settings.tone_volume * self.settings.volume);
+    }
+
     pub fn clamp_view(&mut self) {
         let duration = self.duration().max(MIN_SPAN);
         self.view.span = self.view.span.clamp(MIN_SPAN, duration);
-        self.view.start = self.view.start.clamp(0.0, duration - self.view.span);
+        if self.vertical() {
+            // The playhead can sit on the piano edge at either end of the track.
+            self.view.start = self.view.start.clamp(-self.view.span, duration);
+        } else {
+            self.view.start = self.view.start.clamp(0.0, duration - self.view.span);
+        }
         let range = (self.view.pitch_hi - self.view.pitch_lo).clamp(6.0, PITCH_MAX - PITCH_MIN);
         self.view.pitch_lo = self.view.pitch_lo.clamp(PITCH_MIN, PITCH_MAX - range);
         self.view.pitch_hi = self.view.pitch_lo + range;
@@ -491,6 +519,12 @@ impl App {
 
     fn follow_playhead(&mut self, now: f64) {
         if !self.playing || !matches!(self.drag, Drag::None) || now - self.last_pan < 2.0 {
+            return;
+        }
+        if self.vertical() {
+            if self.settings.follow != Follow::Off {
+                self.align_to_piano();
+            }
             return;
         }
         match self.settings.follow {
@@ -534,7 +568,7 @@ impl App {
         if key(Key::Escape) {
             if self.fullscreen {
                 self.set_fullscreen(false, ctx);
-            } else if self.session.selection.take().is_some() {
+            } else if self.loop_anchor.take().is_none() && self.session.selection.take().is_some() {
                 self.touch_session();
             }
         }
@@ -682,10 +716,23 @@ impl App {
             ui.selectable_value(&mut self.settings.sidebar, SidebarTab::Playlist, RichText::new("Playlist").size(15.0));
         });
         ui.separator();
-        let list_height = ui.available_height().max(80.0);
+        // Display settings live at the bottom, folded away until wanted. The
+        // list above gets whatever height they left free on the last frame.
+        let total = ui.available_height();
+        let list_height = (total - self.settings_height - 14.0).max(80.0);
         match tab {
             SidebarTab::Bookmarks => self.bookmark_list(ui, list_height),
             SidebarTab::Playlist => self.playlist(ui, list_height),
+        }
+        ui.separator();
+        let settings = egui::ScrollArea::vertical()
+            .id_salt("display-settings")
+            .max_height(ui.available_height())
+            .show(ui, |ui| self.display_settings(ui));
+        let height = settings.content_size.y.min(total - 94.0);
+        if height != self.settings_height {
+            self.settings_height = height;
+            ui.ctx().request_repaint();
         }
     }
 
@@ -1032,9 +1079,6 @@ impl App {
                 ui.checkbox(&mut keep_pitch, "Keep pitch (time-stretch)")
                     .on_hover_text("Off: plain resampling like a tape machine, so pitch follows speed");
                 ui.end_row();
-                ui.label("When pausing");
-                ui.checkbox(&mut settings.return_on_pause, "Return to where playback started");
-                ui.end_row();
                 ui.label("When a track ends");
                 ui.checkbox(&mut settings.auto_advance, "Play the next one in the playlist")
                     .on_hover_text("Unless a loop is on");
@@ -1087,35 +1131,8 @@ impl App {
                 ui.end_row();
             });
 
-            section(ui, "Spectrogram");
-            grid(ui, "spectrogram", &mut |ui| {
-                ui.label("Theme");
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("theme").width(190.0).selected_text(settings.theme.label()).show_ui(
-                        ui,
-                        |ui| {
-                            for theme in Theme::ALL {
-                                ui.horizontal(|ui| {
-                                    theme_swatch(ui, theme, 48.0);
-                                    ui.selectable_value(&mut settings.theme, theme, theme.label());
-                                });
-                            }
-                        },
-                    );
-                });
-                ui.end_row();
-                ui.label("");
-                theme_swatch(ui, settings.theme, 200.0);
-                ui.end_row();
-                ui.label("Dynamic range");
-                ui.add(egui::Slider::new(&mut settings.range_db, 30.0..=100.0).step_by(1.0).suffix(" dB"))
-                    .on_hover_text("Lower hides quiet detail");
-                ui.end_row();
-                ui.label("Octave lines");
-                ui.checkbox(&mut settings.octave_lines, "Mark every C across the display");
-                ui.end_row();
-            });
-
+            ui.add_space(8.0);
+            ui.weak("Spectrogram and waveform settings are at the bottom of the sidebar.");
             ui.add_space(10.0);
             ui.separator();
             if ui.button("Reset to defaults").clicked() {
@@ -1130,6 +1147,71 @@ impl App {
             }
         });
         self.show_preferences = open;
+    }
+
+    fn display_settings(&mut self, ui: &mut Ui) {
+        let settings = &mut self.settings;
+        let mut show_piano_range = false;
+        let slider_width = (ui.available_width() - 150.0).max(60.0);
+        ui.spacing_mut().slider_width = slider_width;
+        egui::CollapsingHeader::new(RichText::new("Spectrogram").strong()).id_salt("spectrogram-settings").show(ui, |ui| {
+            egui::ComboBox::from_id_salt("theme").width(ui.available_width() - 8.0).selected_text(settings.theme.label()).show_ui(
+                ui,
+                |ui| {
+                    for theme in Theme::ALL {
+                        ui.horizontal(|ui| {
+                            theme_swatch(ui, theme, 48.0);
+                            ui.selectable_value(&mut settings.theme, theme, theme.label());
+                        });
+                    }
+                },
+            );
+            theme_swatch(ui, settings.theme, ui.available_width() - 8.0);
+            ui.add(egui::Slider::new(&mut settings.range_db, 30.0..=100.0).step_by(1.0).suffix(" dB").text("range"))
+                .on_hover_text("Dynamic range shown: lower hides quiet detail");
+            ui.add(egui::Slider::new(&mut settings.brightness_db, -20.0..=30.0).step_by(1.0).suffix(" dB").text("brightness"))
+                .on_hover_text("Raise to bring out quiet notes, lower if loud ones wash out");
+            ui.checkbox(&mut settings.smooth, "Smooth").on_hover_text("Blend between cells instead of showing them as blocks");
+            ui.checkbox(&mut settings.octave_lines, "Octave lines").on_hover_text("A line at every C");
+            ui.checkbox(&mut settings.semitone_lines, "Semitone lines")
+                .on_hover_text("A faint line between every pair of notes, when zoomed in far enough");
+            ui.checkbox(&mut settings.harmonics, "Harmonics of the hovered pitch")
+                .on_hover_text("Marks where overtones 2 to 8 of the pitch under the cursor would lie,\nto tell a played note from an overtone of a lower one");
+            ui.separator();
+            ui.checkbox(&mut settings.piano_mode, "Piano mode").on_hover_text(
+                "Piano along the bottom, low notes on the left, with time running vertically above it.\n\
+                 With playhead following on, the playhead stays on the piano's edge",
+            );
+            ui.add_enabled(settings.piano_mode, egui::Checkbox::new(&mut settings.reverse, "Reverse direction")).on_hover_text(
+                "Off: what is coming falls from the top towards the piano.\n\
+                 On: what has been played rises from the piano",
+            );
+            ui.add(egui::Slider::new(&mut settings.tone_volume, 0.0..=1.0).show_value(false).text("piano tone volume"))
+                .on_hover_text("Click or drag on the piano to hear a note");
+            show_piano_range = ui.button("Show all 88 keys").clicked();
+        });
+        egui::CollapsingHeader::new(RichText::new("Waveform").strong()).id_salt("waveform-settings").show(ui, |ui| {
+            ui.add(egui::Slider::new(&mut settings.wave_zoom, 1.0..=32.0).logarithmic(true).suffix("×").text("zoom"))
+                .on_hover_text("Magnify quiet passages; loud ones clip at the edge");
+            ui.checkbox(&mut settings.wave_log, "Decibel scale")
+                .on_hover_text("Shows level over a 60 dB range, so quiet detail is visible next to loud");
+            ui.checkbox(&mut settings.wave_centre_line, "Centre line");
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut settings.wave_colour);
+                ui.label("Colour");
+                if ui.small_button("Reset").clicked() {
+                    settings.wave_colour = Settings::default().wave_colour;
+                }
+            });
+            if settings.view == ViewMode::Both {
+                ui.weak("Drag the divider between waveform and spectrogram to resize them.");
+            }
+        });
+        if show_piano_range {
+            self.view.pitch_lo = PITCH_MIN;
+            self.view.pitch_hi = 108.5;
+        }
+        ui.add_space(2.0);
     }
 
     fn loop_combo(&mut self, ui: &mut Ui, width: f32) {
@@ -1172,6 +1254,8 @@ impl App {
             if icon_button(ui, Icon::Next, enabled).on_hover_text("Next bookmark ( ] )").clicked() {
                 self.next_bookmark();
             }
+            ui.checkbox(&mut self.settings.return_on_pause, "Return")
+                .on_hover_text("When pausing, put the playhead back where playback started");
             ui.separator();
             ui.label("Loop");
             self.loop_combo(ui, 130.0);
@@ -1275,8 +1359,11 @@ impl App {
             ("Ctrl+,", "Preferences"),
         ];
         const MOUSE: &[(&str, &str)] = &[
-            ("Click", "Move the playhead"),
-            ("Drag", "Select a loop region (drag its edges to adjust)"),
+            ("Click or drag", "Move the playhead"),
+            ("Ctrl+click", "Place loop points: start, then end; after that, move the nearer one"),
+            ("Ctrl+drag", "Select a loop region (drag its edges to adjust)"),
+            ("Click the piano", "Play that note"),
+            ("Drag the divider", "Resize waveform against spectrogram"),
             ("Right-drag", "Pan the display"),
             ("Scroll", "Zoom the timeline (Shift: pan)"),
             ("Alt+scroll", "Zoom the pitch axis"),

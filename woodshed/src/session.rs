@@ -165,6 +165,29 @@ pub struct Settings {
     pub loop_gap: f64,
     /// Dynamic range shown by the spectrogram, dB.
     pub range_db: f32,
+    /// Shifts the top of the spectrogram's colour scale, dB; positive is brighter.
+    pub brightness_db: f32,
+    /// Interpolate between spectrogram cells rather than show them as blocks.
+    pub smooth: bool,
+    /// Faint lines between semitones.
+    pub semitone_lines: bool,
+    /// Mark the harmonics of the pitch under the cursor.
+    pub harmonics: bool,
+    /// Piano along the bottom (low to high), time running vertically.
+    pub piano_mode: bool,
+    /// In piano mode: show what has been played rising from the piano,
+    /// rather than what is coming falling towards it.
+    pub reverse: bool,
+    /// Share of the "Both" view given to the waveform.
+    pub split: f32,
+    /// Vertical magnification of the waveform.
+    pub wave_zoom: f32,
+    /// Draw the waveform on a decibel scale.
+    pub wave_log: bool,
+    pub wave_colour: [u8; 3],
+    pub wave_centre_line: bool,
+    /// Loudness of the tones played from the piano.
+    pub tone_volume: f32,
     pub theme: Theme,
     /// Faint lines across the spectrogram at every C.
     pub octave_lines: bool,
@@ -194,6 +217,18 @@ impl Default for Settings {
             loop_mode: LoopMode::default(),
             loop_gap: 0.0,
             range_db: 70.0,
+            brightness_db: 0.0,
+            smooth: true,
+            semitone_lines: false,
+            harmonics: false,
+            piano_mode: false,
+            reverse: false,
+            split: 0.28,
+            wave_zoom: 1.0,
+            wave_log: false,
+            wave_colour: [120, 172, 232],
+            wave_centre_line: true,
+            tone_volume: 0.5,
             theme: Theme::default(),
             octave_lines: true,
             seek_step: 2.0,
