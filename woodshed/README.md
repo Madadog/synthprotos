@@ -60,8 +60,19 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
 - **Preferences** (`Ctrl+,`): playback behaviour, seek steps, playhead
   following, interface size, spectrogram theme and range.
 
-Reads MP3, FLAC, WAV, Ogg Vorbis, AAC/M4A, ALAC, AIFF, CAF and standard MIDI
-files.
+## File types
+
+- **Built in**: MP3 (and MP1/MP2), FLAC, WAV, Ogg Vorbis, Opus, AAC/M4A/M4B,
+  ALAC, AIFF, CAF, and the audio track of MP4, MOV, Matroska and WebM video.
+- **MIDI**: `.mid`, `.midi`, karaoke `.kar` and RIFF `.rmi`.
+- **Through ffmpeg**, when it is installed and on the `PATH`: anything else it
+  can read, such as WMA, WavPack, Monkey's Audio, Musepack, TTA, AC-3, DTS,
+  AMR, DSD, AVI, and tracker modules. Without ffmpeg these give an error
+  saying so.
+- **Playlists**: M3U / M3U8, PLS and XSPF (read and write); ASX and WPL
+  (read).
+- **CUE sheets**: opening a `.cue` opens the audio file it names and turns
+  its tracks into labelled bookmarks.
 
 ## Build and run
 
@@ -114,7 +125,8 @@ it has its own `Cargo.lock`.
 
 ## How it works
 
-- `track.rs` decodes the whole file into memory with Symphonia.
+- `track.rs` decodes the whole file into memory with Symphonia (plus a
+  pure-Rust Opus decoder), falling back to an `ffmpeg` subprocess.
 - `midi.rs` parses MIDI files into notes and renders them to audio with
   rustysynth.
 - `engine.rs` plays it: an optional WSOLA time-stretcher for the speed control, loop

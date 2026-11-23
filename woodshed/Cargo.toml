@@ -13,6 +13,7 @@ description = "A music player for transcription and rehearsal: zoomable waveform
 eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "clipboard"] }
 cpal = "0.18"
 symphonia = { version = "0.6", features = ["all"] }
+symphonia-adapter-opus-rs = "0.1"
 egui_extras = { version = "0.37", default-features = false }
 midly = { version = "0.5", default-features = false, features = ["std", "alloc"] }
 rustysynth = "1.3"

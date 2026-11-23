@@ -299,6 +299,20 @@ impl Session {
         id
     }
 
+    /// Add bookmarks from elsewhere (a CUE sheet), skipping any that are
+    /// already there. Returns whether anything was added.
+    pub fn import_bookmarks(&mut self, marks: &[(f64, String)]) -> bool {
+        let before = self.bookmarks.len();
+        for (time, label) in marks {
+            if !self.bookmarks.iter().any(|b| (b.time - time).abs() < 0.05) {
+                self.bookmarks.push(Bookmark { id: self.next_id, time: *time, label: label.clone() });
+                self.next_id += 1;
+            }
+        }
+        self.sort();
+        self.bookmarks.len() > before
+    }
+
     pub fn sort(&mut self) {
         self.bookmarks.sort_by(|a, b| a.time.total_cmp(&b.time));
     }
@@ -540,5 +554,12 @@ mod tests {
         assert_eq!(s.section(5.0, 60.0), (0.0, 10.0));
         assert_eq!(s.section(20.0, 60.0), (20.0, 30.0));
         assert_eq!(s.section(45.0, 60.0), (30.0, 60.0));
+
+        // Importing skips marks already present, and keeps the order.
+        let marks = [(20.0, "Verse".to_owned()), (25.0, "Bridge".to_owned())];
+        assert!(s.import_bookmarks(&marks));
+        assert!(!s.import_bookmarks(&marks));
+        let labels: Vec<&str> = s.bookmarks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["Mark 2", "Mark 3", "Bridge", "Mark 1"]);
     }
 }

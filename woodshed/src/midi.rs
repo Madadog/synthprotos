@@ -12,7 +12,9 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use crate::pitch::midi_to_freq;
 use crate::track::Track;
 
-pub const EXTENSIONS: &[&str] = &["mid", "midi"];
+/// Standard MIDI files, karaoke files (the same thing with lyrics) and
+/// RIFF-wrapped MIDI.
+pub const EXTENSIONS: &[&str] = &["mid", "midi", "kar", "rmi"];
 /// MIDI files are rendered at this rate.
 const SAMPLE_RATE: u32 = 44100;
 /// Rendered after the last event, for releases and reverb to die away.
@@ -72,6 +74,9 @@ impl MidiSong {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<MidiSong, String> {
+        // A RIFF MIDI file (.rmi) is a standard file inside a wrapper.
+        let wrapped = bytes.starts_with(b"RIFF").then(|| bytes.windows(4).position(|w| w == b"MThd")).flatten();
+        let bytes = &bytes[wrapped.unwrap_or(0)..];
         let smf = Smf::parse(bytes).map_err(|e| format!("Not a valid MIDI file: {e}"))?;
         // Merge the tracks into one stream ordered by tick.
         let mut merged: Vec<(u64, usize, TrackEventKind)> = Vec::new();
@@ -327,6 +332,10 @@ pub mod tests {
         assert_eq!(channels, [(0, "Flute", 2), (9, "Drums", 1)]);
         assert!((song.length - 1.625).abs() < 1e-9);
         assert!(MidiSong::parse(b"RIFF....").is_err());
+        // The same file in a RIFF wrapper.
+        let mut rmi = b"RIFF\x00\x00\x00\x00RMIDdata\x00\x00\x00\x00".to_vec();
+        rmi.extend(sample_file());
+        assert_eq!(MidiSong::parse(&rmi).unwrap().notes, song.notes);
     }
 
     #[test]

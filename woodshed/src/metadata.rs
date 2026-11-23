@@ -29,7 +29,31 @@ pub fn read(path: &Path) -> Meta {
         let duration = crate::midi::duration(path);
         return Meta { duration, unreadable: duration.is_none(), ..Meta::default() };
     }
-    read_tags(path).unwrap_or(Meta { unreadable: true, ..Meta::default() })
+    read_tags(path).or_else(|| read_with_ffprobe(path)).unwrap_or(Meta { unreadable: true, ..Meta::default() })
+}
+
+/// For formats the built-in readers do not know, ask ffprobe (if installed).
+fn read_with_ffprobe(path: &Path) -> Option<Meta> {
+    if !path.exists() || !crate::track::ffmpeg_available() {
+        return None;
+    }
+    let info = crate::track::ffprobe(path, "format=duration:format_tags")?;
+    let format = info.get("format")?;
+    // Tag names vary in case between formats.
+    let tag = |name: &str| {
+        let tags = format.get("tags")?.as_object()?;
+        let value = tags.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))?.1.as_str()?.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    };
+    Some(Meta {
+        title: tag("title"),
+        artist: tag("artist"),
+        album: tag("album"),
+        // "3" or "3/12"
+        track_number: tag("track").and_then(|t| t.split('/').next()?.trim().parse().ok()),
+        duration: Some(format.get("duration")?.as_str()?.parse().ok()?),
+        unreadable: false,
+    })
 }
 
 fn read_tags(path: &Path) -> Option<Meta> {

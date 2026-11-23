@@ -127,6 +127,8 @@ pub struct App {
     soundfont_dialog: Option<Receiver<Option<PathBuf>>>,
     /// Bit per MIDI channel hidden in the MIDI view.
     pub midi_hidden: u16,
+    /// Track marks from CUE sheets, to become bookmarks when their file loads.
+    cue_marks: std::collections::HashMap<PathBuf, Vec<(f64, String)>>,
 }
 
 impl App {
@@ -180,6 +182,7 @@ impl App {
             soundfont_error: None,
             soundfont_dialog: None,
             midi_hidden: 0,
+            cue_marks: Default::default(),
         };
         app.load_soundfont(&cc.egui_ctx);
         app.open_files(files, &cc.egui_ctx);
@@ -195,8 +198,24 @@ impl App {
     /// One file is simply opened; several are added to the playlist (and
     /// the first opened if nothing is loaded yet).
     fn open_files(&mut self, files: Vec<PathBuf>, ctx: &egui::Context) {
-        let (lists, files): (Vec<PathBuf>, Vec<PathBuf>) =
-            files.iter().map(|p| absolute(p)).partition(|p| playlist_io::is_playlist(p));
+        // A CUE sheet stands for the audio it names; its tracks become bookmarks.
+        let mut expanded = Vec::new();
+        for file in files.iter().map(|p| absolute(p)) {
+            if !playlist_io::is_cue(&file) {
+                expanded.push(file);
+                continue;
+            }
+            match playlist_io::read_cue(&file) {
+                Err(e) => self.error = Some(e),
+                Ok(cue) => {
+                    for audio in cue {
+                        expanded.push(audio.path.clone());
+                        self.cue_marks.insert(audio.path, audio.marks);
+                    }
+                }
+            }
+        }
+        let (lists, files): (Vec<PathBuf>, Vec<PathBuf>) = expanded.into_iter().partition(|p| playlist_io::is_playlist(p));
         // A playlist file becomes a playlist of its own, named after the file.
         for list in lists {
             match playlist_io::read(&list) {
@@ -285,9 +304,9 @@ impl App {
         let (dir, ctx) = (self.settings.last_dir.clone(), ctx.clone());
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new()
-                .add_filter("Audio and playlists", &[track::AUDIO_EXTENSIONS, playlist_io::EXTENSIONS].concat())
+                .add_filter("Audio and playlists", &[track::AUDIO_EXTENSIONS, playlist_io::EXTENSIONS, &[playlist_io::CUE_EXTENSION]].concat())
                 .add_filter("Audio", track::AUDIO_EXTENSIONS)
-                .add_filter("Playlists", playlist_io::EXTENSIONS);
+                .add_filter("Playlists and CUE sheets", &[playlist_io::EXTENSIONS, &[playlist_io::CUE_EXTENSION]].concat());
             if let Some(dir) = dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -305,9 +324,9 @@ impl App {
         let (dir, ctx) = (self.settings.last_dir.clone(), ctx.clone());
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new()
-                .add_filter("Audio and playlists", &[track::AUDIO_EXTENSIONS, playlist_io::EXTENSIONS].concat())
+                .add_filter("Audio and playlists", &[track::AUDIO_EXTENSIONS, playlist_io::EXTENSIONS, &[playlist_io::CUE_EXTENSION]].concat())
                 .add_filter("Audio", track::AUDIO_EXTENSIONS)
-                .add_filter("Playlists", playlist_io::EXTENSIONS);
+                .add_filter("Playlists and CUE sheets", &[playlist_io::EXTENSIONS, &[playlist_io::CUE_EXTENSION]].concat());
             if let Some(dir) = dir {
                 dialog = dialog.set_directory(dir);
             }
@@ -443,6 +462,9 @@ impl App {
                 }
                 let track = Arc::new(track);
                 self.session = Session::load(&track.path);
+                if let Some(marks) = self.cue_marks.remove(&track.path) {
+                    self.session_dirty |= self.session.import_bookmarks(&marks);
+                }
                 {
                     let mut engine = self.engine.lock().unwrap();
                     engine.set_track(Some(track.clone()));

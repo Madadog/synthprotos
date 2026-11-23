@@ -1,11 +1,13 @@
-//! Reading and writing playlist files: M3U / M3U8, PLS and XSPF.
+//! Reading and writing playlist files: M3U / M3U8, PLS and XSPF; reading
+//! Windows Media playlists (ASX, WPL) and CUE sheets.
 //!
 //! Only local files are kept: entries that are web streams are skipped.
 //! Relative entries are resolved against the playlist's own directory.
 
 use std::path::{Path, PathBuf};
 
-pub const EXTENSIONS: &[&str] = &["m3u8", "m3u", "pls", "xspf"];
+pub const EXTENSIONS: &[&str] = &["m3u8", "m3u", "pls", "xspf", "asx", "wax", "wvx", "wpl"];
+pub const CUE_EXTENSION: &str = "cue";
 
 fn extension(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
@@ -27,6 +29,8 @@ pub fn read(path: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match extension(path).as_str() {
         "pls" => parse_pls(text),
         "xspf" => parse_xspf(text),
+        "asx" | "wax" | "wvx" => attribute_values(text, "ref", "href"),
+        "wpl" => attribute_values(text, "media", "src"),
         _ => parse_m3u(text),
     };
     let base = path.parent().unwrap_or(Path::new(""));
@@ -82,6 +86,103 @@ fn parse_xspf(text: &str) -> Vec<String> {
         rest = &after[end + "</location>".len()..];
     }
     locations
+}
+
+/// Values of `attribute` on every `<tag ...>` element, whatever the case
+/// (ASX files are written every which way).
+fn attribute_values(text: &str, tag: &str, attribute: &str) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let mut values = Vec::new();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find(&format!("<{tag}")) {
+        let start = from + found + tag.len() + 1;
+        let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
+        from = end;
+        // A longer tag name that merely starts the same.
+        if lower[start..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let Some(at) = lower[start..end].find(&format!("{attribute}=")) else { continue };
+        let value = &text[start + at + attribute.len() + 1..end];
+        let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else { continue };
+        if let Some(close) = value[1..].find(quote) {
+            values.push(xml_unescape(&value[1..1 + close]));
+        }
+    }
+    values
+}
+
+/// One audio file named by a CUE sheet, and the tracks marked within it.
+#[derive(Debug, PartialEq)]
+pub struct CueFile {
+    pub path: PathBuf,
+    /// Start time in seconds and title of each track.
+    pub marks: Vec<(f64, String)>,
+}
+
+pub fn is_cue(path: &Path) -> bool {
+    extension(path) == CUE_EXTENSION
+}
+
+/// The audio files a CUE sheet describes, with their track start times.
+pub fn read_cue(path: &Path) -> Result<Vec<CueFile>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read CUE sheet: {e}"))?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+    };
+    let files = parse_cue(text.trim_start_matches('\u{feff}'), path.parent().unwrap_or(Path::new("")));
+    if files.is_empty() {
+        return Err(format!("No audio file named in {}", path.display()));
+    }
+    Ok(files)
+}
+
+fn parse_cue(text: &str, base: &Path) -> Vec<CueFile> {
+    // The text of a command's argument, without its quotes.
+    let argument = |rest: &str| match rest.trim().strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next().unwrap_or("").to_owned(),
+        None => rest.trim().to_owned(),
+    };
+    let mut files: Vec<CueFile> = Vec::new();
+    let mut track: Option<(u32, Option<String>)> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        match command.to_ascii_uppercase().as_str() {
+            "FILE" => {
+                // FILE "name with spaces.flac" WAVE
+                let name = match rest.trim().strip_prefix('"') {
+                    Some(_) => argument(rest),
+                    None => rest.trim().rsplit_once(char::is_whitespace).map_or(rest.trim(), |(name, _)| name).to_owned(),
+                };
+                if let Some(path) = resolve(&name, base) {
+                    files.push(CueFile { path, marks: Vec::new() });
+                }
+                track = None;
+            }
+            "TRACK" => track = Some((rest.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0), None)),
+            "TITLE" => {
+                if let Some((_, title)) = &mut track {
+                    *title = Some(argument(rest));
+                }
+            }
+            "INDEX" => {
+                // INDEX 01 mm:ss:ff, with 75 frames to the second. Index 00 is the pre-gap.
+                let mut parts = rest.split_whitespace();
+                let is_start = parts.next().and_then(|n| n.parse::<u32>().ok()) == Some(1);
+                let fields: Vec<f64> = parts.next().unwrap_or("").split(':').filter_map(|f| f.parse().ok()).collect();
+                if let (true, [minutes, seconds, frames], Some((number, title)), Some(file)) =
+                    (is_start, fields.as_slice(), &track, files.last_mut())
+                {
+                    let label = title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| format!("Track {number}"));
+                    file.marks.push((minutes * 60.0 + seconds + frames / 75.0, label));
+                }
+            }
+            _ => {}
+        }
+    }
+    files
 }
 
 /// Turn a playlist entry into an absolute local path; `None` for streams.
@@ -222,6 +323,48 @@ mod tests {
             resolved(parse_xspf(text)),
             ["/x/Rock & Roll/café.mp3", "/music/lists/rel/Tom & Jerry.flac", "/y/z.wav"]
         );
+    }
+
+    #[test]
+    fn windows_media_playlists() {
+        let asx = r#"<ASX Version="3.0"><Title>Set</Title>
+            <Entry><REF HREF="one.mp3"/><Reference x="y"/></Entry>
+            <entry><ref href='/abs/Tom &amp; Jerry.wma' /></entry>
+            <Entry><Ref HREF="mms://example.com/stream"/></Entry></ASX>"#;
+        assert_eq!(resolved(attribute_values(asx, "ref", "href")), ["/music/lists/one.mp3", "/abs/Tom & Jerry.wma"]);
+        let wpl = r#"<?wpl version="1.0"?><smil><head><meta name="Generator" content="x"/></head><body><seq>
+            <media src="..\Albums\a.wma" tid="{1}"/><media src="b.mp3"/></seq></body></smil>"#;
+        assert_eq!(resolved(attribute_values(wpl, "media", "src")), ["/music/lists/../Albums/a.wma", "/music/lists/b.mp3"]);
+    }
+
+    #[test]
+    fn cue_sheets() {
+        let text = r#"REM GENRE Jazz
+PERFORMER "Someone"
+TITLE "The Album"
+FILE "Side A.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Opening"
+    PERFORMER "Someone"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Second Tune"
+    INDEX 00 03:58:10
+    INDEX 01 04:01:37
+  TRACK 03 AUDIO
+    INDEX 01 71:30:00
+FILE side_b.wav WAVE
+  TRACK 04 AUDIO
+    TITLE "Closer"
+    INDEX 01 00:00:00
+"#;
+        let files = parse_cue(text, Path::new("/music/album"));
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, PathBuf::from("/music/album/Side A.flac"));
+        let marks: Vec<(i64, &str)> = files[0].marks.iter().map(|(t, l)| ((t * 1000.0).round() as i64, l.as_str())).collect();
+        // 4:01 and 37 frames of 75; the album title is not a track title.
+        assert_eq!(marks, [(0, "Opening"), (241_493, "Second Tune"), (4_290_000, "Track 3")]);
+        assert_eq!(files[1], CueFile { path: "/music/album/side_b.wav".into(), marks: vec![(0.0, "Closer".into())] });
     }
 
     #[test]
