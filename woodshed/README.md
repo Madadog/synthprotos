@@ -14,8 +14,15 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
   following on, the playhead stays on the piano's edge, so the notes about to
   sound fall onto their keys; "Reverse direction" instead shows what has
   just been played rising from the keys.
-- **Reference tones**: click or drag on the piano to hear a sine tone at
-  that note.
+- **MIDI files** (`.mid`) are played through a SoundFont and can then be
+  looped, slowed and viewed like any recording. Opening one adds a **MIDI**
+  view beside the others: a piano roll with a colour per channel, where
+  clicking a channel's name hides it and right-clicking shows it alone. The
+  SoundFont (`.sf2`) is chosen in Preferences; a General MIDI one installed
+  with the system is used if you choose none, and with none at all a plain
+  built-in tone stands in.
+- **Reference tones**: click or drag on the piano to hear that note, as a
+  sine tone or, if set in Preferences, as any instrument from the SoundFont.
 - **Display settings** fold out at the bottom of the sidebar. Spectrogram:
   theme, range, brightness, smoothing, octave and semitone lines, and
   markers for the harmonics of the pitch under the cursor. Waveform: zoom,
@@ -53,7 +60,8 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
 - **Preferences** (`Ctrl+,`): playback behaviour, seek steps, playhead
   following, interface size, spectrogram theme and range.
 
-Reads MP3, FLAC, WAV, Ogg Vorbis, AAC/M4A, ALAC, AIFF and CAF.
+Reads MP3, FLAC, WAV, Ogg Vorbis, AAC/M4A, ALAC, AIFF, CAF and standard MIDI
+files.
 
 ## Build and run
 
@@ -107,6 +115,8 @@ it has its own `Cargo.lock`.
 ## How it works
 
 - `track.rs` decodes the whole file into memory with Symphonia.
+- `midi.rs` parses MIDI files into notes and renders them to audio with
+  rustysynth.
 - `engine.rs` plays it: an optional WSOLA time-stretcher for the speed control, loop
   handling, and resampling to the output device, driven by a cpal stream.
 - `analysis.rs` builds the waveform peak pyramid and, on background threads,

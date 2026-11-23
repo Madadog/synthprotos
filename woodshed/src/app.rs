@@ -15,8 +15,9 @@ use crate::analysis::{Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
 use crate::display::{Drag, Tiles};
 use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
 use crate::metadata::{self, Meta, MetaCache, SortColumn};
+use crate::midi::{self, MidiSong};
 use crate::playlist_io;
-use crate::session::{Follow, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
+use crate::session::{Follow, KeySound, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
 use crate::track::{self, Track};
 
 pub const ACCENT: Color32 = Color32::from_rgb(255, 184, 76);
@@ -45,12 +46,20 @@ pub struct Loaded {
     pub track: Arc<Track>,
     pub peaks: Arc<Peaks>,
     pub spectrogram: Arc<Spectrogram>,
+    /// The notes, if this is a MIDI file.
+    pub midi: Option<Arc<MidiSong>>,
+    /// A MIDI file rendered with the built-in tone, for want of a SoundFont.
+    basic_synth: bool,
 }
+
+/// What the loading thread hands back: audio, waveform peaks, and for a
+/// MIDI file its notes and whether the built-in tone had to be used.
+type Decoded = (Track, Peaks, Option<(MidiSong, bool)>);
 
 struct Loading {
     name: String,
     progress: Arc<AtomicU32>,
-    rx: Receiver<Result<(Track, Peaks), String>>,
+    rx: Receiver<Result<Decoded, String>>,
 }
 
 /// The visible part of the timeline and pitch axis.
@@ -110,6 +119,14 @@ pub struct App {
     pub sounding: Option<i32>,
     /// Height of the sidebar's display settings on the last frame.
     settings_height: f32,
+
+    /// The SoundFont for MIDI files and (optionally) the piano.
+    soundfont: Option<Arc<rustysynth::SoundFont>>,
+    soundfont_loading: Option<Receiver<Result<Arc<rustysynth::SoundFont>, String>>>,
+    soundfont_error: Option<String>,
+    soundfont_dialog: Option<Receiver<Option<PathBuf>>>,
+    /// Bit per MIDI channel hidden in the MIDI view.
+    pub midi_hidden: u16,
 }
 
 impl App {
@@ -158,7 +175,13 @@ impl App {
             loop_anchor: None,
             sounding: None,
             settings_height: 60.0,
+            soundfont: None,
+            soundfont_loading: None,
+            soundfont_error: None,
+            soundfont_dialog: None,
+            midi_hidden: 0,
         };
+        app.load_soundfont(&cc.egui_ctx);
         app.open_files(files, &cc.egui_ctx);
         app
     }
@@ -237,11 +260,14 @@ impl App {
         let progress = Arc::new(AtomicU32::new(0));
         let (tx, rx) = channel();
         let (path_buf, thread_progress, ctx) = (path.to_path_buf(), progress.clone(), ctx.clone());
+        let font = self.soundfont.clone();
         std::thread::spawn(move || {
-            let result = track::decode(&path_buf, &thread_progress).map(|track| {
-                let peaks = Peaks::build(&track);
-                (track, peaks)
-            });
+            let result = if midi::is_midi(&path_buf) {
+                midi::load(&path_buf, font.as_ref(), &thread_progress).map(|(track, song)| (track, Some((song, font.is_none()))))
+            } else {
+                track::decode(&path_buf, &thread_progress).map(|track| (track, None))
+            };
+            let result = result.map(|(track, song)| (Peaks::build(&track), track, song)).map(|(p, t, s)| (t, p, s));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -312,7 +338,72 @@ impl App {
         self.export_dialog = Some(rx);
     }
 
+    fn has_midi(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.midi.is_some())
+    }
+
+    /// (Re)load the SoundFont named in the settings, or the system's.
+    fn load_soundfont(&mut self, ctx: &egui::Context) {
+        self.soundfont = None;
+        self.soundfont_error = None;
+        self.soundfont_loading = None;
+        self.apply_key_sound();
+        let Some(path) = self.settings.soundfont.clone().or_else(midi::system_soundfont) else {
+            self.soundfont_changed(ctx);
+            return;
+        };
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(midi::load_soundfont(&path));
+            ctx.request_repaint();
+        });
+        self.soundfont_loading = Some(rx);
+    }
+
+    /// Re-render the open MIDI file with the new SoundFont.
+    fn soundfont_changed(&mut self, ctx: &egui::Context) {
+        self.apply_key_sound();
+        if let Some(path) = self.current_path.clone().filter(|p| midi::is_midi(p)) {
+            self.autoplay = false;
+            self.open(&path, ctx);
+        }
+    }
+
+    fn apply_key_sound(&mut self) {
+        let font = self.soundfont.clone().filter(|_| self.settings.key_sound == KeySound::SoundFont);
+        self.engine.lock().unwrap().set_key_sound(font, self.settings.key_program);
+    }
+
+    fn soundfont_dialog(&mut self, ctx: &egui::Context) {
+        if self.soundfont_dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(rfd::FileDialog::new().add_filter("SoundFont", &["sf2"]).pick_file());
+            ctx.request_repaint();
+        });
+        self.soundfont_dialog = Some(rx);
+    }
+
     fn poll_background(&mut self, ctx: &egui::Context) {
+        if let Some(choice) = self.soundfont_dialog.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.soundfont_dialog = None;
+            if let Some(path) = choice {
+                self.settings.soundfont = Some(path);
+                self.load_soundfont(ctx);
+            }
+        }
+        if let Some(result) = self.soundfont_loading.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.soundfont_loading = None;
+            match result {
+                Ok(font) => self.soundfont = Some(font),
+                Err(e) => self.soundfont_error = Some(e),
+            }
+            self.soundfont_changed(ctx);
+        }
         if let Some(choice) = self.export_dialog.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.export_dialog = None;
             if let Some(mut path) = choice {
@@ -344,8 +435,9 @@ impl App {
                 self.error = Some(e);
                 self.autoplay = false;
             }
-            Ok((track, peaks)) => {
+            Ok((track, peaks, song)) => {
                 self.save_session();
+                let had_midi = self.has_midi();
                 if let Some(old) = self.loaded.take() {
                     old.spectrogram.cancel();
                 }
@@ -372,7 +464,14 @@ impl App {
                 self.cue = 0.0;
                 self.drag = Drag::None;
                 self.loop_anchor = None;
-                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram });
+                // A MIDI file brings its own view with it.
+                self.midi_hidden = 0;
+                let basic_synth = song.as_ref().is_some_and(|s| s.1);
+                let midi = song.map(|s| Arc::new(s.0));
+                if midi.is_some() && !had_midi && self.settings.view != ViewMode::Playlist {
+                    self.settings.view = ViewMode::Midi;
+                }
+                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram, midi, basic_synth });
             }
         }
     }
@@ -491,8 +590,9 @@ impl App {
         self.clamp_view();
     }
 
-    pub fn set_tone(&mut self, freq: Option<f64>) {
-        self.engine.lock().unwrap().set_tone(freq, self.settings.tone_volume * self.settings.volume);
+    /// Hold a piano key down (or release it, with `None`).
+    pub fn set_key(&mut self, key: Option<i32>) {
+        self.engine.lock().unwrap().set_key(key, self.settings.tone_volume * self.settings.volume);
     }
 
     pub fn clamp_view(&mut self) {
@@ -573,7 +673,7 @@ impl App {
             }
         }
         if key(Key::V) {
-            let views = ViewMode::choices(self.settings.playlist_view);
+            let views = ViewMode::choices(self.settings.playlist_view, self.has_midi());
             let i = views.iter().position(|&m| m == self.settings.view).unwrap_or(0);
             self.settings.view = views[(i + 1) % views.len()];
         }
@@ -676,6 +776,12 @@ impl App {
                 (None, Some(loaded)) => {
                     ui.label(RichText::new(&loaded.track.name).strong());
                     ui.weak(format!("{} Hz", loaded.track.sample_rate));
+                    if loaded.basic_synth {
+                        ui.colored_label(ui.visuals().warn_fg_color, "basic tones").on_hover_text(
+                            "No SoundFont was found, so this MIDI file is played with a plain built-in tone.\n\
+                             Choose a SoundFont (.sf2) in Preferences for real instrument sounds.",
+                        );
+                    }
                     if !loaded.spectrogram.is_complete() {
                         ui.weak(format!("· analysing {:.0}%", loaded.spectrogram.progress() * 100.0));
                     }
@@ -692,7 +798,7 @@ impl App {
                 if ui.button("Preferences").on_hover_text("Preferences (Ctrl+,)").clicked() {
                     self.show_preferences = !self.show_preferences;
                 }
-                for &mode in ViewMode::choices(self.settings.playlist_view).iter().rev() {
+                for &mode in ViewMode::choices(self.settings.playlist_view, self.has_midi()).iter().rev() {
                     ui.selectable_value(&mut self.settings.view, mode, mode.label());
                 }
                 ui.weak("View (V)");
@@ -1131,6 +1237,53 @@ impl App {
                 ui.end_row();
             });
 
+            section(ui, "Sound");
+            let font_label = match (&settings.soundfont, midi::system_soundfont()) {
+                _ if self.soundfont_loading.is_some() => "Loading…".to_owned(),
+                (Some(path), _) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                (None, Some(path)) => format!("{} (system)", path.file_name().unwrap_or_default().to_string_lossy()),
+                (None, None) => "None found".to_owned(),
+            };
+            let has_font = self.soundfont.is_some();
+            let (mut choose_font, mut clear_font) = (false, false);
+            let key_before = (settings.key_sound, settings.key_program);
+            grid(ui, "sound", &mut |ui| {
+                ui.label("SoundFont").on_hover_text("The instrument sounds used to play MIDI files, and optionally the piano");
+                ui.horizontal(|ui| {
+                    ui.label(&font_label);
+                    choose_font |= ui.button("Choose…").on_hover_text("Pick a SoundFont (.sf2) file").clicked();
+                    if settings.soundfont.is_some() {
+                        clear_font |= ui.button("Use default").on_hover_text("Go back to the system's SoundFont, if any").clicked();
+                    }
+                });
+                ui.end_row();
+                ui.label("Piano keys play");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut settings.key_sound, KeySound::Sine, "Sine wave");
+                    ui.add_enabled_ui(has_font, |ui| {
+                        ui.selectable_value(&mut settings.key_sound, KeySound::SoundFont, "SoundFont instrument")
+                            .on_disabled_hover_text("Needs a SoundFont");
+                    });
+                });
+                ui.end_row();
+                ui.label("Piano instrument");
+                ui.add_enabled_ui(has_font && settings.key_sound == KeySound::SoundFont, |ui| {
+                    egui::ComboBox::from_id_salt("key-program")
+                        .width(190.0)
+                        .selected_text(midi::GM_NAMES[settings.key_program as usize & 127])
+                        .show_ui(ui, |ui| {
+                            for (program, name) in midi::GM_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut settings.key_program, program as u8, *name);
+                            }
+                        });
+                });
+                ui.end_row();
+            });
+            if let Some(error) = &self.soundfont_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            let key_changed = key_before != (settings.key_sound, settings.key_program);
+
             ui.add_space(8.0);
             ui.weak("Spectrogram and waveform settings are at the bottom of the sidebar.");
             ui.add_space(10.0);
@@ -1144,6 +1297,15 @@ impl App {
             }
             if keep_pitch != self.settings.keep_pitch {
                 self.set_keep_pitch(keep_pitch);
+            }
+            if choose_font {
+                self.soundfont_dialog(ui.ctx());
+            }
+            if clear_font {
+                self.settings.soundfont = None;
+                self.load_soundfont(ui.ctx());
+            } else if key_changed {
+                self.apply_key_sound();
             }
         });
         self.show_preferences = open;
@@ -1351,7 +1513,7 @@ impl App {
             ("L", "Loop on / off"),
             ("I / O", "Set the loop start / end at the playhead"),
             ("Esc", "Leave full screen, or clear the selection"),
-            ("V", "Cycle waveform / spectrogram / both (and playlist, if a view)"),
+            ("V", "Cycle the views"),
             ("F", "Full-screen display"),
             ("+ / −", "Zoom in / out"),
             ("Z", "Zoom out to the whole track"),
@@ -1424,7 +1586,13 @@ impl eframe::App for App {
                 }
             }
         }
-        if self.settings.view == ViewMode::Playlist && !self.settings.playlist_view {
+        let gone = match self.settings.view {
+            ViewMode::Playlist => !self.settings.playlist_view,
+            // The MIDI view only exists while a MIDI file is open.
+            ViewMode::Midi => !self.has_midi() && self.loading.is_none(),
+            _ => false,
+        };
+        if gone {
             self.settings.view = ViewMode::default();
         }
         self.hotkeys(&ctx);

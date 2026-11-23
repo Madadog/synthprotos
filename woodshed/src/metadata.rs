@@ -25,6 +25,10 @@ pub struct Meta {
 
 /// Read a file's tags and duration without decoding it.
 pub fn read(path: &Path) -> Meta {
+    if crate::midi::is_midi(path) {
+        let duration = crate::midi::duration(path);
+        return Meta { duration, unreadable: duration.is_none(), ..Meta::default() };
+    }
     read_tags(path).unwrap_or(Meta { unreadable: true, ..Meta::default() })
 }
 

@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
+
+use crate::pitch::midi_to_freq;
 use crate::track::Track;
 
 pub const MIN_SPEED: f64 = 0.25;
@@ -60,6 +63,15 @@ pub struct Engine {
     tone_phase: f64,
     tone_level: f32,
     tone_volume: f32,
+
+    // SoundFont instrument for the piano, when chosen instead of the sine.
+    key_font: Option<Arc<SoundFont>>,
+    key_program: u8,
+    key_synth: Option<Synthesizer>,
+    key_note: Option<i32>,
+    /// Frames the instrument keeps rendering after the last key is released.
+    key_tail: usize,
+    key_scratch: [Vec<f32>; 2],
 }
 
 impl Engine {
@@ -92,6 +104,12 @@ impl Engine {
             tone_phase: 0.0,
             tone_level: 0.0,
             tone_volume: 0.5,
+            key_font: None,
+            key_program: 0,
+            key_synth: None,
+            key_note: None,
+            key_tail: 0,
+            key_scratch: [Vec::new(), Vec::new()],
         }
     }
 
@@ -116,6 +134,25 @@ impl Engine {
 
     pub fn set_output_rate(&mut self, rate: u32) {
         self.out_rate = rate as f64;
+        self.rebuild_key_synth();
+    }
+
+    /// Play the piano's notes with this SoundFont program, or with a sine
+    /// tone when `font` is `None`.
+    pub fn set_key_sound(&mut self, font: Option<Arc<SoundFont>>, program: u8) {
+        self.key_font = font;
+        self.key_program = program;
+        self.rebuild_key_synth();
+    }
+
+    fn rebuild_key_synth(&mut self) {
+        self.key_note = None;
+        self.key_tail = 0;
+        let settings = SynthesizerSettings::new(self.out_rate as i32);
+        self.key_synth = self.key_font.as_ref().and_then(|font| Synthesizer::new(font, &settings).ok());
+        if let Some(synth) = &mut self.key_synth {
+            synth.process_midi_message(0, 0xC0, self.key_program as i32, 0);
+        }
     }
 
     fn rate(&self) -> f64 {
@@ -377,12 +414,49 @@ impl Engine {
                 [] => {}
             }
         }
+        if let Some(synth) = self.key_synth.as_mut().filter(|_| self.key_tail > 0) {
+            let frames = out.len() / channels.max(1);
+            let [left, right] = &mut self.key_scratch;
+            left.resize(frames, 0.0);
+            right.resize(frames, 0.0);
+            synth.render(left, right);
+            let gain = self.tone_volume * 2.0;
+            for (frame, (l, r)) in out.chunks_mut(channels.max(1)).zip(left.iter().zip(right.iter())) {
+                match frame {
+                    [m] => *m += (l + r) * 0.5 * gain,
+                    [a, b, ..] => {
+                        *a += l * gain;
+                        *b += r * gain;
+                    }
+                    [] => {}
+                }
+            }
+            if self.key_note.is_none() {
+                self.key_tail = self.key_tail.saturating_sub(frames);
+            }
+        }
     }
 
-    /// Sound a sine tone at `freq` Hz until called again with `None`.
-    pub fn set_tone(&mut self, freq: Option<f64>, volume: f32) {
-        self.tone = freq;
+    /// Hold down a piano key (a MIDI note number) until called again with
+    /// another key or `None`.
+    pub fn set_key(&mut self, key: Option<i32>, volume: f32) {
         self.tone_volume = volume.clamp(0.0, 1.0);
+        let Some(synth) = &mut self.key_synth else {
+            self.tone = key.map(|k| midi_to_freq(k as f64));
+            return;
+        };
+        self.tone = None;
+        if key != self.key_note {
+            if let Some(old) = self.key_note {
+                synth.note_off(0, old);
+            }
+            if let Some(new) = key {
+                synth.note_on(0, new, 100);
+            }
+            self.key_note = key;
+        }
+        // Long enough for the release and reverb to ring out.
+        self.key_tail = (self.out_rate * 4.0) as usize;
     }
 }
 
@@ -582,19 +656,38 @@ mod tests {
     fn tone_sounds_without_a_track_and_fades_out() {
         let mut e = Engine::new();
         e.set_output_rate(SR);
-        e.set_tone(Some(440.0), 0.5);
+        e.set_key(Some(69), 0.5);
         let out = render(&mut e, SR as usize / 2);
         let body = &out[4800..];
         assert!((zero_crossing_freq(body) - 440.0).abs() < 0.5);
         let peak = body.iter().fold(0.0f32, |a, x| a.max(x.abs()));
         assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
         // A change of note keeps the waveform continuous.
-        e.set_tone(Some(880.0), 0.5);
+        e.set_key(Some(81), 0.5);
         let next = render(&mut e, 480);
         assert!((next[0] - out[out.len() - 1]).abs() < 0.06);
-        e.set_tone(None, 0.5);
+        e.set_key(None, 0.5);
         let tail = render(&mut e, SR as usize / 10);
         assert!(tail[4000..].iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn soundfont_key_sounds_then_dies_away() {
+        let Some(path) = crate::midi::system_soundfont() else { return };
+        let mut e = Engine::new();
+        e.set_output_rate(SR);
+        e.set_key_sound(Some(crate::midi::load_soundfont(&path).unwrap()), 0);
+        e.set_key(Some(60), 0.5);
+        let held = render(&mut e, SR as usize / 2);
+        assert!(held.iter().any(|x| x.abs() > 0.01));
+        e.set_key(None, 0.5);
+        render(&mut e, SR as usize * 5);
+        let after = render(&mut e, 4800);
+        assert!(after.iter().all(|x| *x == 0.0));
+        // Back to the sine when the SoundFont is taken away.
+        e.set_key_sound(None, 0);
+        e.set_key(Some(69), 0.5);
+        assert!((zero_crossing_freq(&render(&mut e, SR as usize / 2)[4800..]) - 440.0).abs() < 0.5);
     }
 
     #[test]

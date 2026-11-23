@@ -14,6 +14,7 @@ use eframe::egui::{
 
 use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE, PITCH_MAX, PITCH_MIN, ROWS};
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
+use crate::midi::{MidiSong, Note};
 use crate::pitch;
 use crate::session::{LoopMode, Settings, Theme, ViewMode};
 use crate::track::Track;
@@ -252,6 +253,11 @@ impl App {
         let (track, peaks, spectrogram) = (loaded.track.clone(), loaded.peaks.clone(), loaded.spectrogram.clone());
         let duration = track.duration();
         let now = ui.input(|i| i.time);
+        // The MIDI view shows the file's notes where the spectrogram would be.
+        let song = loaded.midi.clone().filter(|_| self.settings.view == ViewMode::Midi);
+        if let Some(song) = &song {
+            self.midi_legend(ui, song);
+        }
 
         let full = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(full, Sense::click_and_drag());
@@ -376,7 +382,7 @@ impl App {
             .map(|pitch| pitch.round() as i32);
         if key_down != self.sounding {
             self.sounding = key_down;
-            self.set_tone(key_down.map(|midi| pitch::midi_to_freq(midi as f64)));
+            self.set_key(key_down);
         }
 
         if let Some(p) = hover {
@@ -430,14 +436,18 @@ impl App {
         let g = Geometry::new(full, &self.settings, &self.view);
         let content = painter.with_clip_rect(g.timed);
         let theme = self.settings.theme;
+        let light = theme.is_light() && song.is_none();
         if let Some(rect) = g.wave {
             draw_waveform(&content.with_clip_rect(rect), rect, &g, &track, &peaks, &self.settings);
         }
         if let (Some(rect), Some(pitch)) = (g.spec, g.pitch) {
             let clipped = content.with_clip_rect(rect);
-            self.tiles.draw(ui.ctx(), &clipped, &g, &spectrogram, &self.settings, now);
+            match &song {
+                Some(song) => draw_midi(&clipped, &g, rect, pitch, song, self.midi_hidden),
+                None => self.tiles.draw(ui.ctx(), &clipped, &g, &spectrogram, &self.settings, now),
+            }
             let grid = |alpha: u8| {
-                if theme.is_light() { Color32::from_black_alpha(alpha * 2) } else { Color32::from_white_alpha(alpha) }
+                if light { Color32::from_black_alpha(alpha * 2) } else { Color32::from_white_alpha(alpha) }
             };
             let along = g.along_range(rect);
             let key_size = pitch.scale().abs() as f32;
@@ -449,7 +459,7 @@ impl App {
             for midi in (12..=120).step_by(12).filter(|_| self.settings.octave_lines) {
                 g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(22)));
             }
-            if !spectrogram.is_complete() {
+            if !spectrogram.is_complete() && song.is_none() {
                 clipped.text(
                     rect.right_top() + vec2(-8.0, 6.0),
                     Align2::RIGHT_TOP,
@@ -533,7 +543,7 @@ impl App {
         if let Some(p) = hover.filter(|p| g.timed.contains(*p)) {
             // On a light spectrogram the crosshair needs a dark line.
             let in_spec = g.spec.is_some_and(|r| r.contains(p));
-            let light = theme.is_light() && in_spec;
+            let light = light && in_spec;
             let colour = if light { Color32::from_black_alpha(140) } else { Color32::from_white_alpha(90) };
             let line = Stroke::new(1.0, colour);
             g.time_line(&content, g.along(p), across, line);
@@ -542,6 +552,16 @@ impl App {
                 let along = g.along_range(rect);
                 g.cross_line(&content, g.across(p), along, line);
                 text = format!("{}   {:.1} Hz\n{text}", pitch::describe(midi), pitch::midi_to_freq(midi));
+                // In the MIDI view, say which note this is.
+                let t = g.time_at(p);
+                let hidden = self.midi_hidden;
+                let under = song.as_ref().and_then(|s| {
+                    let hit = |n: &&Note| n.key as i32 == midi.round() as i32 && n.start <= t && t <= n.end && hidden >> n.channel & 1 == 0;
+                    let note = s.notes.iter().rev().find(hit)?;
+                    let channel = s.channels.iter().find(|c| c.channel == note.channel)?;
+                    Some(format!("\nch {} {}   velocity {}", note.channel + 1, channel.name(), note.velocity))
+                });
+                text += under.as_deref().unwrap_or("");
                 if self.settings.harmonics {
                     // Where the overtones of this pitch would lie.
                     let clipped = content.with_clip_rect(rect);
@@ -565,6 +585,32 @@ impl App {
             painter.rect_stroke(bubble, CornerRadius::same(4), Stroke::new(1.0, Color32::from_white_alpha(40)), StrokeKind::Inside);
             painter.galley(corner + vec2(6.0, 4.0), galley, Color32::WHITE);
         }
+    }
+
+    /// A row of the MIDI file's channels; click one to hide or show its notes.
+    fn midi_legend(&mut self, ui: &mut Ui, song: &MidiSong) {
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Channels");
+                for channel in &song.channels {
+                    let bit = 1u16 << channel.channel;
+                    let shown = self.midi_hidden & bit == 0;
+                    let text = format!("{} {} ({})", channel.channel + 1, channel.name(), channel.notes);
+                    let colour = if shown { channel_colour(channel.channel) } else { ui.visuals().weak_text_color() };
+                    let chip = ui
+                        .selectable_label(shown, egui::RichText::new(text).color(colour))
+                        .on_hover_text("Click to hide or show this channel; right-click to show only it");
+                    if chip.clicked() {
+                        self.midi_hidden ^= bit;
+                    }
+                    if chip.secondary_clicked() {
+                        // Solo, or back to everything if it already is.
+                        let others = song.channels.iter().filter(|c| c.channel != channel.channel).fold(0, |m, c| m | 1 << c.channel);
+                        self.midi_hidden = if self.midi_hidden == others { 0 } else { others };
+                    }
+                }
+            });
+        });
     }
 
     fn flags(&self, painter: &Painter, g: &Geometry) -> Vec<Flag> {
@@ -756,6 +802,48 @@ fn draw_piano(painter: &Painter, rect: Rect, axis: Axis, along_bottom: bool, hov
         painter.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, Color32::BLACK));
     } else {
         painter.vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, Color32::BLACK));
+    }
+}
+
+/// A distinct colour for each of the 16 MIDI channels.
+fn channel_colour(channel: u8) -> Color32 {
+    const COLOURS: [[u8; 3]; 16] = [
+        [102, 178, 255], [255, 159, 67], [120, 220, 130], [255, 107, 129], [190, 140, 255], [255, 214, 80],
+        [80, 220, 220], [255, 140, 200], [170, 200, 90], [200, 200, 200], [120, 150, 255], [255, 190, 150],
+        [90, 200, 160], [230, 120, 230], [210, 170, 110], [150, 230, 255],
+    ];
+    let [r, g, b] = COLOURS[channel as usize & 15];
+    Color32::from_rgb(r, g, b)
+}
+
+/// The piano roll: one bar per note, coloured by channel and shaded by velocity.
+fn draw_midi(painter: &Painter, g: &Geometry, rect: Rect, pitch: Axis, song: &MidiSong, hidden: u16) {
+    let along = g.along_range(rect);
+    let strip = |a: f32, b: f32, from: f32, to: f32| Rect::from_two_pos(g.point(from, a), g.point(to, b));
+    // Rows under the black keys are a shade darker, as in a sequencer.
+    for key in (pitch.lo.floor() as i32..=pitch.hi.ceil() as i32).filter(|k| pitch::is_black_key(*k)) {
+        let row = strip(pitch.at(key as f64 - 0.5), pitch.at(key as f64 + 0.5), along.min, along.max);
+        painter.rect_filled(row, CornerRadius::ZERO, Color32::from_black_alpha(70));
+    }
+    let key_size = pitch.scale().abs() as f32;
+    for note in &song.notes {
+        if note.start > g.time.hi {
+            break; // sorted by start
+        }
+        if note.end < g.time.lo || hidden >> note.channel & 1 == 1 {
+            continue;
+        }
+        let (a, b) = (g.time.at(note.start), g.time.at(note.end));
+        // Keep very short notes (drum hits) visible.
+        let b = if (b - a).abs() < 2.5 { a + 2.5 * g.time.length.signum() } else { b };
+        let inset = if key_size > 5.0 { 0.5 } else { 0.0 };
+        let (lo, hi) = (pitch.at(note.key as f64 - 0.5), pitch.at(note.key as f64 + 0.5));
+        let bar = strip(lo.min(hi) + inset, lo.max(hi) - inset, a, b);
+        let colour = channel_colour(note.channel).gamma_multiply(0.45 + 0.55 * note.velocity as f32 / 127.0);
+        painter.rect_filled(bar, CornerRadius::same(if key_size > 6.0 { 2 } else { 0 }), colour);
+        // A bright leading edge marks where each note starts.
+        let edge = strip(lo.min(hi) + inset, lo.max(hi) - inset, a, a + 1.5 * g.time.length.signum());
+        painter.rect_filled(edge, CornerRadius::ZERO, Color32::from_white_alpha(150));
     }
 }
 

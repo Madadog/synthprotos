@@ -5,6 +5,7 @@ mod app;
 mod display;
 mod engine;
 mod metadata;
+mod midi;
 mod pitch;
 mod playlist_io;
 mod session;

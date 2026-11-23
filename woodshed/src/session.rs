@@ -10,15 +10,19 @@ pub enum ViewMode {
     #[default]
     Spectrogram,
     Both,
+    /// Piano roll of a MIDI file (only offered while one is open).
+    Midi,
     /// The playlist as a table (when enabled in the preferences).
     Playlist,
 }
 
 impl ViewMode {
     /// The views on offer; the playlist is one only if `playlist_view` is on.
-    pub fn choices(playlist_view: bool) -> &'static [ViewMode] {
-        const ALL: [ViewMode; 4] = [ViewMode::Waveform, ViewMode::Spectrogram, ViewMode::Both, ViewMode::Playlist];
-        &ALL[..if playlist_view { 4 } else { 3 }]
+    pub fn choices(playlist_view: bool, midi: bool) -> Vec<ViewMode> {
+        let mut views = vec![ViewMode::Waveform, ViewMode::Spectrogram, ViewMode::Both];
+        views.extend(midi.then_some(ViewMode::Midi));
+        views.extend(playlist_view.then_some(ViewMode::Playlist));
+        views
     }
 
     pub fn label(self) -> &'static str {
@@ -26,6 +30,7 @@ impl ViewMode {
             ViewMode::Waveform => "Waveform",
             ViewMode::Spectrogram => "Spectrogram",
             ViewMode::Both => "Both",
+            ViewMode::Midi => "MIDI",
             ViewMode::Playlist => "Playlist",
         }
     }
@@ -145,6 +150,14 @@ impl Theme {
     }
 }
 
+/// What clicking the piano plays.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum KeySound {
+    #[default]
+    Sine,
+    SoundFont,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum SidebarTab {
     #[default]
@@ -188,6 +201,12 @@ pub struct Settings {
     pub wave_centre_line: bool,
     /// Loudness of the tones played from the piano.
     pub tone_volume: f32,
+    pub key_sound: KeySound,
+    /// General MIDI program the piano plays when using the SoundFont.
+    pub key_program: u8,
+    /// SoundFont for MIDI files and the piano; `None` uses one installed
+    /// with the system, if any.
+    pub soundfont: Option<PathBuf>,
     pub theme: Theme,
     /// Faint lines across the spectrogram at every C.
     pub octave_lines: bool,
@@ -229,6 +248,9 @@ impl Default for Settings {
             wave_colour: [120, 172, 232],
             wave_centre_line: true,
             tone_volume: 0.5,
+            key_sound: KeySound::default(),
+            key_program: 0,
+            soundfont: None,
             theme: Theme::default(),
             octave_lines: true,
             seek_step: 2.0,
