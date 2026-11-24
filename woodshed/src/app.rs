@@ -1298,6 +1298,18 @@ impl App {
                     }
                 });
                 ui.end_row();
+                if crate::wayland_session_with_x11() {
+                    ui.label("Dropping files");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut settings.x11_on_wayland, "Run through X11 (takes effect on restart)").on_hover_text(
+                            "Files cannot be dropped onto a native Wayland window, so by default the player\n\
+                             runs through X11 on Wayland desktops. Turn this off to run natively: text may be\n\
+                             sharper with fractional display scaling, but dropping files will not work",
+                        );
+                        reset_button(ui, &mut settings.x11_on_wayland, defaults.x11_on_wayland);
+                    });
+                    ui.end_row();
+                }
                 ui.label("Interface size");
                 ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("scale")

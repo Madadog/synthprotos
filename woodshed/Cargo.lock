@@ -3726,6 +3726,7 @@ dependencies = [
  "serde_json",
  "symphonia",
  "symphonia-adapter-opus-rs",
+ "winit",
 ]
 
 [[package]]

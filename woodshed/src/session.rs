@@ -631,6 +631,9 @@ pub struct Settings {
     /// When a track ends, play the next one in the playlist.
     pub auto_advance: bool,
     pub sidebar: SidebarTab,
+    /// On a Wayland desktop, run through X11 (XWayland) instead, because
+    /// files cannot be dropped onto a native Wayland window.
+    pub x11_on_wayland: bool,
     /// Show the playlist as a full view with metadata columns, instead of
     /// as a sidebar tab.
     pub playlist_view: bool,
@@ -678,6 +681,7 @@ impl Default for Settings {
             keep_pitch: true,
             auto_advance: true,
             sidebar: SidebarTab::default(),
+            x11_on_wayland: true,
             playlist_view: false,
             last_dir: None,
         }

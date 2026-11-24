@@ -96,6 +96,11 @@ cargo run --release -- path/to/song.mp3   # optional; several files go into the 
 On Linux, the ALSA headers are needed to build (`libasound2-dev` on
 Debian/Ubuntu). Without an audio device the player still runs, silently.
 
+On a Wayland desktop the window is opened through X11 (XWayland), because
+the windowing library cannot receive dropped files on Wayland. A preference
+turns this off; dropping files then stops working, but text may be sharper
+with fractional display scaling.
+
 This crate is deliberately not part of the workspace at the repository root:
 it has its own `Cargo.lock`.
 
