@@ -11,12 +11,13 @@ use eframe::egui::{
     Shape, Stroke, Ui,
 };
 
-use crate::analysis::{Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
+use crate::analysis::{Job, Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
 use crate::display::{Drag, Tiles};
 use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
 use crate::metadata::{self, Meta, MetaCache, SortColumn};
 use crate::midi::{self, MidiSong};
 use crate::playlist_io;
+use crate::session::{Listen, SpectrogramSource, Stereo, WaveChannels};
 use crate::session::{Analysis, FreqScale, LevelScale, Resolution, TimeStep, WindowShape};
 use crate::session::{Follow, KeySound, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
 use crate::track::{self, Track};
@@ -47,8 +48,8 @@ pub struct Loaded {
     pub track: Arc<Track>,
     pub peaks: Arc<Peaks>,
     pub spectrogram: Arc<Spectrogram>,
-    /// The settings the spectrogram was computed with.
-    analysis: Analysis,
+    /// What the spectrogram was computed from, and how.
+    job: Job,
     /// The notes, if this is a MIDI file.
     pub midi: Option<Arc<MidiSong>>,
     /// A MIDI file rendered with the built-in tone, for want of a SoundFont.
@@ -360,16 +361,26 @@ impl App {
         self.export_dialog = Some(rx);
     }
 
+    /// What the spectrogram should be computed from: the analysis settings,
+    /// a linear grid for the linear axis, and the channel being examined.
+    fn job(&self) -> Job {
+        Job {
+            analysis: self.settings.analysis,
+            linear: self.settings.freq_scale == FreqScale::Linear,
+            channel: self.settings.stereo.spectrogram_channel(),
+        }
+    }
+
     /// Analyse the open track again after a change to the analysis settings.
     fn reanalyse(&mut self, ctx: &egui::Context) {
-        let analysis = self.settings.analysis;
-        let Some(loaded) = self.loaded.as_mut().filter(|l| l.analysis != analysis) else { return };
+        let job = self.job();
+        let Some(loaded) = self.loaded.as_mut().filter(|l| l.job != job) else { return };
         loaded.spectrogram.cancel();
         let wake = ctx.clone();
-        loaded.spectrogram = Spectrogram::start(loaded.track.clone(), analysis, move || {
+        loaded.spectrogram = Spectrogram::start(loaded.track.clone(), job, move || {
             wake.request_repaint_after(std::time::Duration::from_millis(100))
         });
-        loaded.analysis = analysis;
+        loaded.job = job;
         self.tiles = Tiles::default();
     }
 
@@ -492,8 +503,8 @@ impl App {
                 // Reopen the device at the track's rate where possible.
                 self.output = Output::open(&self.engine, Some(track.sample_rate));
                 let wake = ctx.clone();
-                let analysis = self.settings.analysis;
-                let spectrogram = Spectrogram::start(track.clone(), analysis, move || {
+                let job = self.job();
+                let spectrogram = Spectrogram::start(track.clone(), job, move || {
                     wake.request_repaint_after(std::time::Duration::from_millis(100))
                 });
                 self.view.start = 0.0;
@@ -510,7 +521,7 @@ impl App {
                 if midi.is_some() && !had_midi && self.settings.view != ViewMode::Playlist {
                     self.settings.view = ViewMode::Midi;
                 }
-                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram, analysis, midi, basic_synth });
+                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram, job, midi, basic_synth });
             }
         }
     }
@@ -1472,6 +1483,17 @@ impl App {
             ui.checkbox(&mut settings.wave_log, "Decibel scale")
                 .on_hover_text("Shows level over a 60 dB range, so quiet detail is visible next to loud");
             ui.checkbox(&mut settings.wave_centre_line, "Centre line");
+            ui.separator();
+            ui.checkbox(&mut settings.oscilloscope, "Oscilloscope mode").on_hover_text(
+                "Show the waveform as a live trace of the audio at the playhead, instead of along the timeline.\n\
+                 Each trace starts where the signal crosses zero going up, so steady notes stand still",
+            );
+            ui.add_enabled_ui(settings.oscilloscope, |ui| {
+                ui.add(egui::Slider::new(&mut settings.scope_ms, 2.0..=200.0).logarithmic(true).suffix(" ms").text("length"))
+                    .on_hover_text("How much audio one trace shows: shorter for high notes, longer for low");
+                ui.checkbox(&mut settings.scope_xy, "Left against right")
+                    .on_hover_text("A vectorscope: mono sound is a vertical line, wide stereo spreads sideways,\nout-of-phase sound lies flat");
+            });
             ui.horizontal(|ui| {
                 ui.color_edit_button_srgb(&mut settings.wave_colour);
                 ui.label("Colour");
@@ -1481,6 +1503,54 @@ impl App {
             });
             if settings.view == ViewMode::Both {
                 ui.weak("Drag the divider between waveform and spectrogram to resize them.");
+            }
+        });
+        let stereo = &mut settings.stereo;
+        egui::CollapsingHeader::new(RichText::new("Stereo").strong()).id_salt("stereo-settings").show(ui, |ui| {
+            let combo = |ui: &mut Ui, id: &str, selected: &str, contents: &mut dyn FnMut(&mut Ui)| {
+                egui::ComboBox::from_id_salt(id).width((ui.available_width() - 88.0).max(90.0)).selected_text(selected).show_ui(ui, contents);
+            };
+            ui.horizontal(|ui| {
+                combo(ui, "listen", stereo.listen.label(), &mut |ui| {
+                    for listen in Listen::ALL {
+                        ui.selectable_value(&mut stereo.listen, listen, listen.label());
+                    }
+                });
+                ui.label("listen to").on_hover_text(
+                    "Which part of the stereo image plays.\n\
+                     Side removes whatever is in the centre (often the lead vocal), leaving what is panned;\n\
+                     Mid is the opposite",
+                );
+            });
+            ui.add(egui::Slider::new(&mut stereo.balance, -1.0..=1.0).step_by(0.05).text("balance"))
+                .on_hover_text("Left to right. Turns down the far side");
+            ui.add(egui::Slider::new(&mut stereo.width, 0.0..=2.0).step_by(0.05).text("width")).on_hover_text(
+                "Mid/side processing: scales the side signal.\n0 is mono, 1 is unchanged, 2 is twice as wide",
+            );
+            ui.checkbox(&mut stereo.invert_right, "Invert right channel")
+                .on_hover_text("Flips the right channel's polarity first, which swaps what counts as mid and side");
+            ui.separator();
+            ui.horizontal(|ui| {
+                combo(ui, "wave-channels", stereo.wave.label(), &mut |ui| {
+                    for wave in WaveChannels::ALL {
+                        ui.selectable_value(&mut stereo.wave, wave, wave.label());
+                    }
+                });
+                ui.label("waveform").on_hover_text("Which channels the waveform (and oscilloscope) draws, each in its own lane");
+            });
+            ui.horizontal(|ui| {
+                combo(ui, "spectrogram-source", stereo.spectrogram.label(), &mut |ui| {
+                    for source in SpectrogramSource::ALL {
+                        ui.selectable_value(&mut stereo.spectrogram, source, source.label());
+                    }
+                });
+                ui.label("spectrogram").on_hover_text(
+                    "Which signal the spectrogram analyses. \"What is heard\" follows the channel chosen above.\n\
+                     Changing it analyses the track again",
+                );
+            });
+            if *stereo != Stereo::default() && ui.small_button("Reset stereo").clicked() {
+                *stereo = Stereo::default();
             }
         });
         if show_piano_range {
@@ -1742,7 +1812,11 @@ impl eframe::App for App {
         self.reanalyse(&ctx);
         self.follow_playhead(now);
         let region = self.loop_region();
-        self.engine.lock().unwrap().set_loop(region, self.settings.loop_gap);
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.set_loop(region, self.settings.loop_gap);
+            engine.set_stereo(self.settings.stereo.matrix());
+        }
 
         if self.playing {
             ctx.request_repaint();

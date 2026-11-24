@@ -12,11 +12,11 @@ use eframe::egui::{
     Rangef, Rect, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Ui,
 };
 
-use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE, PITCH_MAX, PITCH_MIN, ROWS};
+use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE};
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
 use crate::midi::{MidiSong, Note};
 use crate::pitch;
-use crate::session::{FreqScale, LevelScale, LoopMode, Settings, Theme, ViewMode};
+use crate::session::{Channel, FreqScale, LevelScale, LoopMode, Settings, Theme, ViewMode};
 use crate::track::Track;
 
 const RULER_HEIGHT: f32 = 38.0;
@@ -300,6 +300,9 @@ impl App {
         };
         let over_piano = |p: Pos2| g.piano.is_some_and(|r| r.contains(p));
         let over_divider = |p: Pos2| g.divider().is_some_and(|r| r.contains(p));
+        // The oscilloscope has no time axis of its own to click on.
+        let scope = g.wave.filter(|_| self.settings.oscilloscope);
+        let over_scope = |p: Pos2| scope.is_some_and(|r| r.contains(p));
         let hover = response.hover_pos();
         let pointer = response.interact_pointer_pos();
         let (origin, primary, ctrl) =
@@ -313,6 +316,8 @@ impl App {
                 Drag::Piano
             } else if over_divider(origin) {
                 Drag::Divider
+            } else if over_scope(origin) {
+                Drag::None
             } else if let Some((id, _)) = flag_at(origin) {
                 Drag::Bookmark { id }
             } else if let Some(start) = edge_at(origin, self.session.selection) {
@@ -378,7 +383,7 @@ impl App {
             self.drag = Drag::None;
         }
         if let Some(p) = pointer.filter(|_| response.clicked()) {
-            if over_piano(p) || over_divider(p) {
+            if over_piano(p) || over_divider(p) || over_scope(p) {
                 // Handled as a note, or nothing.
             } else if let Some((_, time)) = flag_at(p) {
                 self.seek(time);
@@ -456,7 +461,16 @@ impl App {
         let theme = self.settings.theme;
         let light = theme.is_light() && song.is_none();
         if let Some(rect) = g.wave {
-            draw_waveform(&content.with_clip_rect(rect), rect, &g, &track, &peaks, &self.settings);
+            // One lane per channel shown, side by side across the time axis.
+            let lanes = self.settings.stereo.wave.lanes();
+            for (index, &channel) in lanes.iter().enumerate() {
+                let lane = lane(rect, index, lanes.len(), !g.vertical);
+                let clipped = content.with_clip_rect(lane);
+                draw_waveform(&clipped, lane, &g, &track, &peaks, &self.settings, channel);
+                if lanes.len() > 1 {
+                    lane_label(&clipped, lane, channel);
+                }
+            }
         }
         if let (Some(rect), Some(pitch)) = (g.spec, g.pitch) {
             let clipped = content.with_clip_rect(rect);
@@ -552,19 +566,28 @@ impl App {
         }
 
         // Piano, hover crosshair and readout.
+        if let Some(rect) = scope {
+            draw_scope(&painter.with_clip_rect(rect), rect, &track, self.pos, &self.settings);
+        }
         let hover = hover.filter(|_| matches!(self.drag, Drag::None | Drag::Select { .. } | Drag::Scrub | Drag::Piano));
         let on_pitch = |p: &Pos2| g.spec.is_some_and(|r| r.contains(*p)) || over_piano(*p);
         let hover_pitch = hover.filter(on_pitch).and_then(|p| g.pitch_at(p));
         if let (Some(rect), Some(pitch)) = (g.piano, g.pitch) {
             draw_piano(&painter.with_clip_rect(rect), rect, pitch, g.vertical, hover_pitch, self.sounding);
         }
-        if let Some(p) = hover.filter(|p| g.timed.contains(*p)) {
+        if let Some(p) = hover.filter(|p| g.timed.contains(*p) && !over_scope(*p)) {
             // On a light spectrogram the crosshair needs a dark line.
             let in_spec = g.spec.is_some_and(|r| r.contains(p));
             let light = light && in_spec;
             let colour = if light { Color32::from_black_alpha(140) } else { Color32::from_white_alpha(90) };
             let line = Stroke::new(1.0, colour);
-            g.time_line(&content, g.along(p), across, line);
+            // The crosshair stays out of the oscilloscope, which has no time axis.
+            let line_across = match (scope, g.spec) {
+                (Some(_), Some(spec)) => g.across_range(spec),
+                (Some(_), None) => Rangef::new(across.min, across.min),
+                (None, _) => across,
+            };
+            g.time_line(&content, g.along(p), line_across, line);
             let mut text = format_time(g.time_at(p), if self.view.span < 2.0 { 3 } else { 2 });
             if let (Some(midi), Some(rect), Some(pitch)) = (hover_pitch.filter(|_| in_spec), g.spec, g.pitch) {
                 let along = g.along_range(rect);
@@ -689,20 +712,45 @@ fn draw_ruler_ticks(painter: &Painter, g: &Geometry, duration: f64) {
     }
 }
 
-fn draw_waveform(painter: &Painter, rect: Rect, g: &Geometry, track: &Track, peaks: &Peaks, settings: &Settings) {
+/// Where a sample sits across a waveform lane, as a fraction of its half-height
+/// (-1..=1, a little more when clipping), after the zoom and scale settings.
+fn wave_level(settings: &Settings, sample: f32) -> f32 {
+    let v = sample * settings.wave_zoom.max(0.1);
+    // On the decibel scale, 60 dB below full scale is the centre line.
+    let v = if settings.wave_log { v.signum() * (1.0 + 20.0 * v.abs().max(1e-6).log10() / 60.0).max(0.0) } else { v };
+    v.clamp(-1.05, 1.05)
+}
+
+/// The `index`th of `count` equal lanes of `rect`, side by side along `vertical_split`.
+fn lane(rect: Rect, index: usize, count: usize, stacked: bool) -> Rect {
+    let range = if stacked { rect.y_range() } else { rect.x_range() };
+    let at = |i: usize| range.min + range.span() * i as f32 / count as f32;
+    let part = Rangef::new(at(index), at(index + 1));
+    if stacked { Rect::from_x_y_ranges(rect.x_range(), part) } else { Rect::from_x_y_ranges(part, rect.y_range()) }
+}
+
+/// A small letter naming a lane's channel.
+fn lane_label(painter: &Painter, rect: Rect, channel: Channel) {
+    let at = rect.left_top() + vec2(5.0, 3.0);
+    painter.text(at, Align2::LEFT_TOP, channel.letter(), FontId::monospace(11.0), Color32::from_white_alpha(140));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_waveform(
+    painter: &Painter,
+    rect: Rect,
+    g: &Geometry,
+    track: &Track,
+    peaks: &Peaks,
+    settings: &Settings,
+    channel: Channel,
+) {
     let across = g.across_range(rect);
     let along = g.along_range(rect);
     let mid = across.center();
     // Positive samples go up, or to the right when time is vertical.
     let amp = across.span() * 0.47 * if g.vertical { 1.0 } else { -1.0 };
-    let zoom = settings.wave_zoom.max(0.1);
-    let log = settings.wave_log;
-    let level = move |sample: f32| -> f32 {
-        let v = sample * zoom;
-        // On the decibel scale, 60 dB below full scale is the centre line.
-        let v = if log { v.signum() * (1.0 + 20.0 * v.abs().max(1e-6).log10() / 60.0).max(0.0) } else { v };
-        mid + v.clamp(-1.05, 1.05) * amp
-    };
+    let level = move |sample: f32| -> f32 { mid + wave_level(settings, sample) * amp };
     if settings.wave_centre_line {
         g.cross_line(painter, mid, along, Stroke::new(1.0, Color32::from_white_alpha(30)));
     }
@@ -715,7 +763,8 @@ fn draw_waveform(painter: &Painter, rect: Rect, g: &Geometry, track: &Track, pea
         // Zoomed in to individual samples: join them up.
         let first = (axis.lo * sr).floor() as i64;
         let last = (axis.hi * sr).ceil() as i64;
-        let points: Vec<Pos2> = (first..=last).map(|f| g.point(axis.at(f as f64 / sr), level(track.mono(f)))).collect();
+        let points: Vec<Pos2> =
+            (first..=last).map(|f| g.point(axis.at(f as f64 / sr), level(track.channel(f, channel)))).collect();
         if frames_per_point < 0.12 {
             for p in &points {
                 painter.circle_filled(*p, 2.0, colour);
@@ -732,11 +781,72 @@ fn draw_waveform(painter: &Painter, rect: Rect, g: &Geometry, track: &Track, pea
         if b < 0.0 || a >= track.frames() as f64 {
             continue;
         }
-        let (lo, hi) = peaks.range(track, a, b);
+        let (lo, hi) = peaks.range(track, channel, a, b);
         let (x, y) = (level(lo), level(hi));
         let (from, to) = (x.min(y), x.max(y).max(x.min(y) + 1.0));
         g.time_line(painter, c + 0.5, Rangef::new(from, to), stroke);
     }
+}
+
+/// Oscilloscope mode: a short stretch of audio starting at the playhead,
+/// held steady by starting each trace where the signal crosses zero going up.
+fn draw_scope(painter: &Painter, rect: Rect, track: &Track, pos: f64, settings: &Settings) {
+    painter.rect_filled(rect, CornerRadius::ZERO, BACKGROUND);
+    let sr = track.sample_rate as f64;
+    let window = ((settings.scope_ms as f64 / 1000.0 * sr) as i64).max(16);
+    let playhead = (pos * sr) as i64;
+    let start = (playhead..playhead + window)
+        .find(|&i| track.mono(i) <= 0.0 && track.mono(i + 1) > 0.0)
+        .unwrap_or(playhead);
+    let [r, green, b] = settings.wave_colour;
+    let colour = Color32::from_rgb(r, green, b);
+    let faint = Stroke::new(1.0, Color32::from_white_alpha(30));
+    if settings.scope_xy {
+        // Left against right, turned so that mono is a vertical line and
+        // out-of-phase sound spreads sideways.
+        let centre = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.46;
+        let turn = std::f32::consts::FRAC_1_SQRT_2;
+        for (dir, name) in [(vec2(-1.0, -1.0), "L"), (vec2(1.0, -1.0), "R")] {
+            let end = dir * turn * radius;
+            painter.line_segment([centre - end, centre + end], faint);
+            painter.text(centre + end * 1.06, Align2::CENTER_CENTER, name, FontId::monospace(11.0), Color32::from_white_alpha(140));
+        }
+        let points: Vec<Pos2> = (start..start + window)
+            .map(|i| {
+                let [left, right] = track.stereo(i).map(|s| wave_level(settings, s));
+                centre + vec2(right - left, -(left + right)) * turn * radius
+            })
+            .collect();
+        painter.line(points, Stroke::new(1.0, colour.gamma_multiply(0.8)));
+    } else {
+        let lanes = settings.stereo.wave.lanes();
+        for (index, &channel) in lanes.iter().enumerate() {
+            let lane = lane(rect, index, lanes.len(), true);
+            let (mid, amp) = (lane.center().y, lane.height() * 0.47);
+            if settings.wave_centre_line {
+                painter.hline(lane.x_range(), mid, faint);
+            }
+            let points: Vec<Pos2> = (0..=window)
+                .map(|i| {
+                    let x = lane.left() + lane.width() * i as f32 / window as f32;
+                    pos2(x, mid - wave_level(settings, track.channel(start + i, channel)) * amp)
+                })
+                .collect();
+            painter.with_clip_rect(lane.intersect(painter.clip_rect())).line(points, Stroke::new(1.5, colour));
+            if lanes.len() > 1 {
+                lane_label(painter, lane, channel);
+            }
+        }
+    }
+    let label = if settings.scope_xy { "Left against right".to_owned() } else { format!("{:.0} ms", settings.scope_ms) };
+    painter.text(
+        rect.right_top() + vec2(-8.0, 5.0),
+        Align2::RIGHT_TOP,
+        format!("Oscilloscope · {label}"),
+        FontId::proportional(11.5),
+        Color32::from_white_alpha(120),
+    );
 }
 
 /// The piano: one equal strip per semitone, black keys short, every C
@@ -869,7 +979,8 @@ fn draw_midi(painter: &Painter, g: &Geometry, rect: Rect, pitch: Axis, song: &Mi
 
 /// Spectrogram columns per tile texture.
 const TILE: usize = 1024;
-const MAX_TILES: usize = 40;
+/// Texture memory allowed for tiles, in texels.
+const TILE_BUDGET: usize = 40 * TILE * 400;
 const MAX_LEVEL: u32 = 12;
 
 /// Everything that decides a tile's pixels besides the analysis itself.
@@ -933,7 +1044,6 @@ impl Tiles {
         let level = (cols_per_pixel.log2().floor().max(0.0) as u32).min(MAX_LEVEL);
         let tile_cols = TILE << level;
 
-        let v = |p: f64| ((PITCH_MAX - p) / (PITCH_MAX - PITCH_MIN)) as f32;
         let mut budget = 2;
         let first = (c0.max(0.0) as usize) / tile_cols;
         let last = ((c1.max(0.0) as usize) / tile_cols).min((spec.cols - 1) / tile_cols);
@@ -978,13 +1088,15 @@ impl Tiles {
                 let mut mesh = egui::Mesh::with_texture(tile.texture.id());
                 // The texture's rows are even in pitch, so on a mel or hertz
                 // axis it is drawn as a stack of strips, each stretched to fit.
-                let strips: u32 = if pitch.warp == FreqScale::Pitch { 1 } else { 96 };
+                // (A linear axis over the linear grid needs no stretching either.)
+                let even = if spec.linear { FreqScale::Linear } else { FreqScale::Pitch };
+                let strips: u32 = if pitch.warp == even { 1 } else { 96 };
                 for i in 0..=strips {
                     let p = pitch.lo + (pitch.hi - pitch.lo) * i as f64 / strips as f64;
                     for (col, u) in [(a, 0.0), (b, 1.0)] {
                         mesh.vertices.push(egui::epaint::Vertex {
                             pos: g.point(along(col), pitch.at(p)),
-                            uv: pos2(u, v(p)),
+                            uv: pos2(u, spec.v(p)),
                             color: Color32::WHITE,
                         });
                     }
@@ -996,10 +1108,11 @@ impl Tiles {
                 painter.add(Shape::mesh(mesh));
             }
         }
-        if self.tiles.len() > MAX_TILES {
+        let max_tiles = (TILE_BUDGET / (TILE * spec.rows)).max(12);
+        if self.tiles.len() > max_tiles {
             let mut ages: Vec<u64> = self.tiles.values().map(|t| t.used).collect();
             ages.sort_unstable();
-            let cutoff = ages[ages.len() - MAX_TILES];
+            let cutoff = ages[ages.len() - max_tiles];
             self.tiles.retain(|_, t| t.used >= cutoff);
         }
     }
@@ -1008,27 +1121,28 @@ impl Tiles {
 fn build_tile(spec: &Spectrogram, level: u32, index: usize, lut: &[Color32; 256]) -> ColorImage {
     let step = 1usize << level;
     let first = index * TILE * step;
-    let mut pixels = vec![lut[0]; TILE * ROWS];
+    let rows = spec.rows;
+    let mut pixels = vec![lut[0]; TILE * rows];
     spec.with_data(|data| {
-        let mut column = [0u8; ROWS];
+        let mut column = vec![0u8; rows];
         for x in 0..TILE {
             let a = first + x * step;
             if a >= spec.cols {
                 break;
             }
             let b = (a + step).min(spec.cols);
-            column.copy_from_slice(&data[a * ROWS..][..ROWS]);
+            column.copy_from_slice(&data[a * rows..][..rows]);
             for c in a + 1..b {
-                for (max, value) in column.iter_mut().zip(&data[c * ROWS..][..ROWS]) {
+                for (max, value) in column.iter_mut().zip(&data[c * rows..][..rows]) {
                     *max = (*max).max(*value);
                 }
             }
             for (row, &value) in column.iter().enumerate() {
-                pixels[(ROWS - 1 - row) * TILE + x] = lut[value as usize];
+                pixels[(rows - 1 - row) * TILE + x] = lut[value as usize];
             }
         }
     });
-    ColorImage::new([TILE, ROWS], pixels)
+    ColorImage::new([TILE, rows], pixels)
 }
 
 /// Map stored levels to colours: the loudest level seen (lowered by the

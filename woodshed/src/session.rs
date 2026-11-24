@@ -357,6 +357,197 @@ impl FreqScale {
     }
 }
 
+/// One signal taken from the two channels of a track.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Channel {
+    /// The mono mix, which is also the "mid" of mid/side.
+    Mix,
+    Left,
+    Right,
+    /// Half the difference of the channels: what is not in the centre.
+    Side,
+}
+
+impl Channel {
+    pub const ALL: [Channel; 4] = [Channel::Mix, Channel::Left, Channel::Right, Channel::Side];
+
+    pub fn of(self, left: f32, right: f32) -> f32 {
+        match self {
+            Channel::Mix => (left + right) * 0.5,
+            Channel::Left => left,
+            Channel::Right => right,
+            Channel::Side => (left - right) * 0.5,
+        }
+    }
+
+    pub fn letter(self) -> &'static str {
+        match self {
+            Channel::Mix => "M",
+            Channel::Left => "L",
+            Channel::Right => "R",
+            Channel::Side => "S",
+        }
+    }
+}
+
+/// Which part of the stereo image is played.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
+pub enum Listen {
+    #[default]
+    Stereo,
+    Left,
+    Right,
+    Mid,
+    Side,
+    Swapped,
+}
+
+impl Listen {
+    pub const ALL: [Listen; 6] = [Listen::Stereo, Listen::Left, Listen::Right, Listen::Mid, Listen::Side, Listen::Swapped];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Listen::Stereo => "Stereo",
+            Listen::Left => "Left channel only",
+            Listen::Right => "Right channel only",
+            Listen::Mid => "Mid (centre, as mono)",
+            Listen::Side => "Side (centre removed)",
+            Listen::Swapped => "Left and right swapped",
+        }
+    }
+}
+
+/// Which channels the waveform draws.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WaveChannels {
+    #[default]
+    Mix,
+    LeftRight,
+    MidSide,
+}
+
+impl WaveChannels {
+    pub const ALL: [WaveChannels; 3] = [WaveChannels::Mix, WaveChannels::LeftRight, WaveChannels::MidSide];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WaveChannels::Mix => "Mono mix",
+            WaveChannels::LeftRight => "Left and right",
+            WaveChannels::MidSide => "Mid and side",
+        }
+    }
+
+    pub fn lanes(self) -> &'static [Channel] {
+        match self {
+            WaveChannels::Mix => &[Channel::Mix],
+            WaveChannels::LeftRight => &[Channel::Left, Channel::Right],
+            WaveChannels::MidSide => &[Channel::Mix, Channel::Side],
+        }
+    }
+}
+
+/// Which signal the spectrogram analyses.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SpectrogramSource {
+    /// Whatever "listen to" isolates.
+    #[default]
+    Heard,
+    Mix,
+    Left,
+    Right,
+    Side,
+}
+
+impl SpectrogramSource {
+    pub const ALL: [SpectrogramSource; 5] = [
+        SpectrogramSource::Heard,
+        SpectrogramSource::Mix,
+        SpectrogramSource::Left,
+        SpectrogramSource::Right,
+        SpectrogramSource::Side,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpectrogramSource::Heard => "What is heard",
+            SpectrogramSource::Mix => "Mono mix",
+            SpectrogramSource::Left => "Left",
+            SpectrogramSource::Right => "Right",
+            SpectrogramSource::Side => "Side",
+        }
+    }
+}
+
+/// Stereo handling for playback and display.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Stereo {
+    pub listen: Listen,
+    /// -1 (left) to 1 (right).
+    pub balance: f32,
+    /// Scales the side signal: 0 is mono, 1 unchanged, 2 twice as wide.
+    pub width: f32,
+    /// Flip the polarity of the right channel before anything else.
+    pub invert_right: bool,
+    pub wave: WaveChannels,
+    pub spectrogram: SpectrogramSource,
+}
+
+impl Default for Stereo {
+    fn default() -> Self {
+        Stereo {
+            listen: Listen::default(),
+            balance: 0.0,
+            width: 1.0,
+            invert_right: false,
+            wave: WaveChannels::default(),
+            spectrogram: SpectrogramSource::default(),
+        }
+    }
+}
+
+impl Stereo {
+    /// The output channels as mixes of the input channels:
+    /// `out[i] = m[i][0] * left + m[i][1] * right`.
+    pub fn matrix(&self) -> [[f32; 2]; 2] {
+        type M = [[f32; 2]; 2];
+        // `a` applied after `b`.
+        let then = |b: M, a: M| -> M {
+            std::array::from_fn(|i| std::array::from_fn(|j| a[i][0] * b[0][j] + a[i][1] * b[1][j]))
+        };
+        let polarity: M = [[1.0, 0.0], [0.0, if self.invert_right { -1.0 } else { 1.0 }]];
+        let listen: M = match self.listen {
+            Listen::Stereo => [[1.0, 0.0], [0.0, 1.0]],
+            Listen::Left => [[1.0, 0.0], [1.0, 0.0]],
+            Listen::Right => [[0.0, 1.0], [0.0, 1.0]],
+            Listen::Mid => [[0.5, 0.5], [0.5, 0.5]],
+            Listen::Side => [[0.5, -0.5], [0.5, -0.5]],
+            Listen::Swapped => [[0.0, 1.0], [1.0, 0.0]],
+        };
+        // Mid stays, side is scaled.
+        let (same, other) = (0.5 + 0.5 * self.width, 0.5 - 0.5 * self.width);
+        let width: M = [[same, other], [other, same]];
+        let balance: M = [[1.0 - self.balance.max(0.0), 0.0], [0.0, 1.0 + self.balance.min(0.0)]];
+        then(then(then(polarity, listen), width), balance)
+    }
+
+    /// The signal the spectrogram should analyse.
+    pub fn spectrogram_channel(&self) -> Channel {
+        let channel = match (self.spectrogram, self.listen) {
+            (SpectrogramSource::Left, _) | (SpectrogramSource::Heard, Listen::Left) => Channel::Left,
+            (SpectrogramSource::Right, _) | (SpectrogramSource::Heard, Listen::Right) => Channel::Right,
+            (SpectrogramSource::Side, _) | (SpectrogramSource::Heard, Listen::Side) => Channel::Side,
+            _ => Channel::Mix,
+        };
+        // With the right channel inverted, sum and difference change places.
+        match (channel, self.invert_right && self.spectrogram == SpectrogramSource::Heard) {
+            (Channel::Mix, true) => Channel::Side,
+            (Channel::Side, true) => Channel::Mix,
+            (channel, _) => channel,
+        }
+    }
+}
+
 /// What clicking the piano plays.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KeySound {
@@ -412,6 +603,13 @@ pub struct Settings {
     pub wave_log: bool,
     pub wave_colour: [u8; 3],
     pub wave_centre_line: bool,
+    /// Show the waveform as a live oscilloscope of the audio at the playhead.
+    pub oscilloscope: bool,
+    /// Length of the oscilloscope trace, milliseconds.
+    pub scope_ms: f32,
+    /// Plot left against right (a vectorscope) instead of level against time.
+    pub scope_xy: bool,
+    pub stereo: Stereo,
     /// Loudness of the tones played from the piano.
     pub tone_volume: f32,
     pub key_sound: KeySound,
@@ -464,6 +662,10 @@ impl Default for Settings {
             wave_log: false,
             wave_colour: [120, 172, 232],
             wave_centre_line: true,
+            oscilloscope: false,
+            scope_ms: 25.0,
+            scope_xy: false,
+            stereo: Stereo::default(),
             tone_volume: 0.5,
             key_sound: KeySound::default(),
             key_program: 0,
@@ -788,6 +990,49 @@ mod tests {
         assert!((octave(FreqScale::Linear, 60.0) / octave(FreqScale::Linear, 48.0) - 2.0).abs() < 1e-9);
         let ratio = octave(FreqScale::Mel, 60.0) / octave(FreqScale::Mel, 48.0);
         assert!(ratio > 1.3 && ratio < 2.0, "mel octave ratio {ratio}");
+    }
+
+    #[test]
+    fn stereo_matrix() {
+        let apply = |stereo: &Stereo, l: f32, r: f32| {
+            let m = stereo.matrix();
+            [m[0][0] * l + m[0][1] * r, m[1][0] * l + m[1][1] * r]
+        };
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6;
+        let with = |change: &dyn Fn(&mut Stereo)| {
+            let mut stereo = Stereo::default();
+            change(&mut stereo);
+            stereo
+        };
+        assert!(near(apply(&Stereo::default(), 0.3, -0.7), [0.3, -0.7]));
+        assert!(near(apply(&with(&|s| s.listen = Listen::Left), 0.3, -0.7), [0.3, 0.3]));
+        assert!(near(apply(&with(&|s| s.listen = Listen::Right), 0.3, -0.7), [-0.7, -0.7]));
+        assert!(near(apply(&with(&|s| s.listen = Listen::Mid), 0.3, -0.7), [-0.2, -0.2]));
+        assert!(near(apply(&with(&|s| s.listen = Listen::Side), 0.3, -0.7), [0.5, 0.5]));
+        assert!(near(apply(&with(&|s| s.listen = Listen::Swapped), 0.3, -0.7), [-0.7, 0.3]));
+        // Width 0 is mono; width 2 doubles the difference and keeps the sum.
+        assert!(near(apply(&with(&|s| s.width = 0.0), 0.3, -0.7), [-0.2, -0.2]));
+        assert!(near(apply(&with(&|s| s.width = 2.0), 0.3, -0.7), [0.8, -1.2]));
+        // Balance turns down the far side only.
+        assert!(near(apply(&with(&|s| s.balance = 0.5), 0.4, 0.4), [0.2, 0.4]));
+        assert!(near(apply(&with(&|s| s.balance = -1.0), 0.4, 0.4), [0.4, 0.0]));
+        // A centred signal vanishes from the side, and from the mix once one channel is inverted.
+        assert!(near(apply(&with(&|s| s.listen = Listen::Side), 0.6, 0.6), [0.0, 0.0]));
+        let inverted_mid = with(&|s| {
+            s.invert_right = true;
+            s.listen = Listen::Mid;
+        });
+        assert!(near(apply(&inverted_mid, 0.6, 0.6), [0.0, 0.0]));
+
+        assert_eq!(Stereo::default().spectrogram_channel(), Channel::Mix);
+        assert_eq!(with(&|s| s.listen = Listen::Side).spectrogram_channel(), Channel::Side);
+        assert_eq!(inverted_mid.spectrogram_channel(), Channel::Side);
+        let explicit = with(&|s| {
+            s.listen = Listen::Side;
+            s.spectrogram = SpectrogramSource::Left;
+        });
+        assert_eq!(explicit.spectrogram_channel(), Channel::Left);
+        assert_eq!(Channel::Side.of(0.3, -0.7), 0.5);
     }
 
     #[test]

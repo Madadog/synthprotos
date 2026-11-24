@@ -1,5 +1,6 @@
-//! Display data derived from a track: waveform peaks and a log-frequency
-//! (pitch-axis) spectrogram computed on background threads.
+//! Display data derived from a track: waveform peaks, and a spectrogram on
+//! either a pitch grid or a linear-frequency grid, computed on background
+//! threads.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -7,46 +8,50 @@ use std::sync::{Arc, RwLock};
 use realfft::RealFftPlanner;
 
 use crate::pitch::midi_to_freq;
-use crate::session::Analysis;
+use crate::session::{Analysis, Channel};
 use crate::track::Track;
 
 // ---------------------------------------------------------------- waveform
 
-/// Min/max pyramid of the mono mix, for drawing the waveform at any zoom.
+/// Min/max pyramids of each channel and mix, for drawing the waveform at
+/// any zoom.
 pub struct Peaks {
-    /// `levels[k]` holds (min, max) per block of `BASE * 4^k` frames.
-    levels: Vec<Vec<[f32; 2]>>,
+    /// Per `Channel`: `levels[k]` holds (min, max) per block of `BASE * 4^k` frames.
+    channels: [Vec<Vec<[f32; 2]>>; 4],
 }
 
 impl Peaks {
     const BASE: usize = 64;
 
     pub fn build(track: &Track) -> Peaks {
-        let base: Vec<[f32; 2]> = track
-            .samples
-            .chunks(Self::BASE * 2)
-            .map(|block| {
-                block.chunks_exact(2).fold([f32::MAX, f32::MIN], |[lo, hi], f| {
-                    let m = (f[0] + f[1]) * 0.5;
-                    [lo.min(m), hi.max(m)]
+        let channels = Channel::ALL.map(|channel| {
+            let base: Vec<[f32; 2]> = track
+                .samples
+                .chunks(Self::BASE * 2)
+                .map(|block| {
+                    block.chunks_exact(2).fold([f32::MAX, f32::MIN], |[lo, hi], f| {
+                        let v = channel.of(f[0], f[1]);
+                        [lo.min(v), hi.max(v)]
+                    })
                 })
-            })
-            .collect();
-        let mut levels = vec![base];
-        while levels.last().unwrap().len() > 64 {
-            let next = levels
-                .last()
-                .unwrap()
-                .chunks(4)
-                .map(|c| c.iter().fold([f32::MAX, f32::MIN], |[lo, hi], p| [lo.min(p[0]), hi.max(p[1])]))
                 .collect();
-            levels.push(next);
-        }
-        Peaks { levels }
+            let mut levels = vec![base];
+            while levels.last().unwrap().len() > 64 {
+                let next = levels
+                    .last()
+                    .unwrap()
+                    .chunks(4)
+                    .map(|c| c.iter().fold([f32::MAX, f32::MIN], |[lo, hi], p| [lo.min(p[0]), hi.max(p[1])]))
+                    .collect();
+                levels.push(next);
+            }
+            levels
+        });
+        Peaks { channels }
     }
 
-    /// (min, max) of the mono mix over frames `[a, b)`.
-    pub fn range(&self, track: &Track, a: f64, b: f64) -> (f32, f32) {
+    /// (min, max) of a channel over frames `[a, b)`.
+    pub fn range(&self, track: &Track, channel: Channel, a: f64, b: f64) -> (f32, f32) {
         let n = track.frames() as i64;
         let a = (a.floor() as i64).clamp(0, n);
         let b = (b.ceil() as i64).clamp(a, n);
@@ -56,18 +61,19 @@ impl Peaks {
         let len = (b - a) as usize;
         if len < Self::BASE * 2 {
             return (a..b).fold((f32::MAX, f32::MIN), |(lo, hi), i| {
-                let m = track.mono(i);
-                (lo.min(m), hi.max(m))
+                let v = track.channel(i, channel);
+                (lo.min(v), hi.max(v))
             });
         }
+        let levels = &self.channels[Channel::ALL.iter().position(|c| *c == channel).unwrap_or(0)];
         // The coarsest level that still gives at least two blocks.
         let mut level = 0;
         let mut block = Self::BASE;
-        while level + 1 < self.levels.len() && block * 8 <= len {
+        while level + 1 < levels.len() && block * 8 <= len {
             level += 1;
             block *= 4;
         }
-        let data = &self.levels[level];
+        let data = &levels[level];
         let i0 = (a as usize / block).min(data.len() - 1);
         let i1 = (b as usize).div_ceil(block).clamp(i0 + 1, data.len());
         data[i0..i1].iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p[0]), hi.max(p[1])))
@@ -80,22 +86,43 @@ pub const ROWS_PER_SEMITONE: usize = 4;
 /// Pitch range of the spectrogram in MIDI note numbers: just below A0 up to C9.
 pub const PITCH_MIN: f64 = 20.5;
 pub const PITCH_MAX: f64 = 120.5;
+/// Rows of the pitch grid.
 pub const ROWS: usize = ((PITCH_MAX - PITCH_MIN) as usize) * ROWS_PER_SEMITONE;
+/// Rows of the linear grid, which runs evenly from 0 Hz to the frequency of `PITCH_MAX`.
+pub const LINEAR_ROWS: usize = 1024;
 /// Stored levels span this many dB below full scale.
 pub const DB_RANGE: f32 = 110.0;
 /// Columns are computed (and become available) in blocks of this many.
 pub const BLOCK: usize = 256;
 
-/// Magnitudes in dB, quantised to bytes, on a log-frequency grid.
+/// What to analyse and how: the user's analysis settings, which grid the
+/// rows lie on, and which channel of the track.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Job {
+    pub analysis: Analysis,
+    /// Rows evenly spaced in hertz (for the linear axis) rather than in pitch.
+    pub linear: bool,
+    pub channel: Channel,
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Job { analysis: Analysis::default(), linear: false, channel: Channel::Mix }
+    }
+}
+
+/// Magnitudes in dB, quantised to bytes, on a pitch or linear-frequency grid.
 ///
 /// Three FFT sizes are combined so low notes get the frequency resolution
 /// they need while high notes keep reasonable time resolution.
 pub struct Spectrogram {
     pub sample_rate: u32,
+    pub rows: usize,
+    pub linear: bool,
     /// Frames between columns.
     pub hop: usize,
     pub cols: usize,
-    /// Column-major: `data[col * ROWS + row]`, row 0 = lowest pitch.
+    /// Column-major: `data[col * rows + row]`, row 0 = lowest pitch.
     data: RwLock<Vec<u8>>,
     block_done: Vec<AtomicBool>,
     blocks_done: AtomicUsize,
@@ -113,7 +140,35 @@ struct RowMap {
 impl Spectrogram {
     /// Allocate the spectrogram and start computing it in the background.
     /// `wake` is called whenever more columns become available.
-    pub fn start(track: Arc<Track>, analysis: Analysis, wake: impl Fn() + Send + Sync + 'static) -> Arc<Spectrogram> {
+    /// Top of the linear grid, Hz.
+    fn top_hz() -> f64 {
+        midi_to_freq(PITCH_MAX)
+    }
+
+    /// Where a pitch lies between the top (0) and bottom (1) rows, for
+    /// looking it up in a texture made from the data.
+    pub fn v(&self, midi: f64) -> f32 {
+        if self.linear {
+            (1.0 - midi_to_freq(midi) / Self::top_hz()) as f32
+        } else {
+            ((PITCH_MAX - midi) / (PITCH_MAX - PITCH_MIN)) as f32
+        }
+    }
+
+    /// The pitch at the centre of a row.
+    #[cfg(test)]
+    pub fn row_pitch(&self, row: usize) -> f64 {
+        if self.linear {
+            let hz = (row as f64 + 0.5) * Self::top_hz() / self.rows as f64;
+            69.0 + 12.0 * (hz / 440.0).log2()
+        } else {
+            PITCH_MIN + (row as f64 + 0.5) / ROWS_PER_SEMITONE as f64
+        }
+    }
+
+    pub fn start(track: Arc<Track>, job: Job, wake: impl Fn() + Send + Sync + 'static) -> Arc<Spectrogram> {
+        let analysis = job.analysis;
+        let rows = if job.linear { LINEAR_ROWS } else { ROWS };
         let scale = (track.sample_rate as f64 / 48000.0).ceil().max(1.0) as usize;
         let scale = scale.next_power_of_two();
         let hop = analysis.time_step.hop() * scale;
@@ -121,9 +176,11 @@ impl Spectrogram {
         let blocks = cols.div_ceil(BLOCK);
         let spec = Arc::new(Spectrogram {
             sample_rate: track.sample_rate,
+            rows,
+            linear: job.linear,
             hop,
             cols,
-            data: RwLock::new(vec![0; cols * ROWS]),
+            data: RwLock::new(vec![0; cols * rows]),
             block_done: (0..blocks).map(|_| AtomicBool::new(false)).collect(),
             blocks_done: AtomicUsize::new(0),
             peak: AtomicU8::new(0),
@@ -134,7 +191,7 @@ impl Spectrogram {
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1)).clamp(1, 6);
         for _ in 0..threads {
             let (spec, track, next_block, wake) = (spec.clone(), track.clone(), next_block.clone(), wake.clone());
-            std::thread::spawn(move || spec.worker(&track, scale, analysis, &next_block, &*wake));
+            std::thread::spawn(move || spec.worker(&track, scale, job, &next_block, &*wake));
         }
         spec
     }
@@ -168,7 +225,8 @@ impl Spectrogram {
         f(&self.data.read().unwrap())
     }
 
-    fn worker(&self, track: &Track, scale: usize, analysis: Analysis, next_block: &AtomicUsize, wake: &dyn Fn()) {
+    fn worker(&self, track: &Track, scale: usize, job: Job, next_block: &AtomicUsize, wake: &dyn Fn()) {
+        let (analysis, rows_n) = (job.analysis, self.rows);
         let sr = track.sample_rate as f64;
         // Longest window first: it serves the lowest notes.
         let shortest = analysis.resolution.window() * scale;
@@ -186,10 +244,19 @@ impl Spectrogram {
         // band edges (250 Hz and 1 kHz) rows cross-fade between two FFT sizes
         // over an octave, so the change of resolution leaves no visible seam.
         let half_row = 0.5 / ROWS_PER_SEMITONE as f64;
-        let map = |fft: usize, pitch: f64| -> Option<RowMap> {
-            let f = midi_to_freq(pitch);
+        // The band of frequencies a row covers: (low edge, centre, high edge).
+        let band_of = |r: usize| -> (f64, f64, f64) {
+            if self.linear {
+                let step = Self::top_hz() / rows_n as f64;
+                (r as f64 * step, (r as f64 + 0.5) * step, (r as f64 + 1.0) * step)
+            } else {
+                let pitch = PITCH_MIN + (r as f64 + 0.5) / ROWS_PER_SEMITONE as f64;
+                (midi_to_freq(pitch - half_row), midi_to_freq(pitch), midi_to_freq(pitch + half_row))
+            }
+        };
+        let map = |fft: usize, (f_lo, f, f_hi): (f64, f64, f64)| -> Option<RowMap> {
             let bin = sr / sizes[fft] as f64;
-            let (k_lo, k_hi) = (midi_to_freq(pitch - half_row) / bin, midi_to_freq(pitch + half_row) / bin);
+            let (k_lo, k_hi) = (f_lo / bin, f_hi / bin);
             if k_hi >= (sizes[fft] / 2 - 1) as f64 {
                 return None; // above Nyquist
             }
@@ -202,11 +269,11 @@ impl Spectrogram {
                 RowMap { fft, lo: k_lo.ceil() as usize, hi: k_hi.floor() as usize, frac: -1.0 }
             })
         };
-        let rows: Vec<Option<(RowMap, RowMap, f32)>> = (0..ROWS)
+        let rows: Vec<Option<(RowMap, RowMap, f32)>> = (0..rows_n)
             .map(|r| {
-                let pitch = PITCH_MIN + (r as f64 + 0.5) / ROWS_PER_SEMITONE as f64;
+                let pitch = band_of(r);
                 // Position on a scale where 0, 1, 2 are the three FFT sizes.
-                let octaves = (midi_to_freq(pitch) / 250.0).log2();
+                let octaves = (pitch.1 / 250.0).log2();
                 let band = (octaves.clamp(-0.5, 0.5) + 0.5) + ((octaves - 2.0).clamp(-0.5, 0.5) + 0.5);
                 if sizes.len() == 1 {
                     return Some((map(0, pitch)?, map(0, pitch)?, 0.0));
@@ -222,7 +289,7 @@ impl Spectrogram {
         let mut outputs: Vec<_> = ffts.iter().map(|f| f.make_output_vec()).collect();
         let mut scratch: Vec<_> = ffts.iter().map(|f| f.make_scratch_vec()).collect();
         let mut power: Vec<Vec<f32>> = bins_needed.iter().map(|&n| vec![0.0; n]).collect();
-        let mut block_out = vec![0u8; BLOCK * ROWS];
+        let mut block_out = vec![0u8; BLOCK * rows_n];
 
         loop {
             let block = next_block.fetch_add(1, Ordering::Relaxed);
@@ -237,14 +304,14 @@ impl Spectrogram {
                 for i in 0..sizes.len() {
                     let first = centre - (sizes[i] / 2) as i64;
                     for (j, (x, w)) in inputs[i].iter_mut().zip(&windows[i]).enumerate() {
-                        *x = track.mono(first + j as i64) * w;
+                        *x = track.channel(first + j as i64, job.channel) * w;
                     }
                     ffts[i].process_with_scratch(&mut inputs[i], &mut outputs[i], &mut scratch[i]).unwrap();
                     for (p, c) in power[i].iter_mut().zip(&outputs[i]) {
                         *p = c.norm_sqr();
                     }
                 }
-                let out = &mut block_out[(col - c0) * ROWS..][..ROWS];
+                let out = &mut block_out[(col - c0) * rows_n..][..rows_n];
                 let level = |m: &RowMap| -> f32 {
                     let p = &power[m.fft];
                     let pw = if m.frac >= 0.0 {
@@ -272,7 +339,7 @@ impl Spectrogram {
             if self.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            self.data.write().unwrap()[c0 * ROWS..c1 * ROWS].copy_from_slice(&block_out[..(c1 - c0) * ROWS]);
+            self.data.write().unwrap()[c0 * rows_n..c1 * rows_n].copy_from_slice(&block_out[..(c1 - c0) * rows_n]);
             self.peak.fetch_max(peak, Ordering::Relaxed);
             self.block_done[block].store(true, Ordering::Relaxed);
             self.blocks_done.fetch_add(1, Ordering::Relaxed);
@@ -303,12 +370,12 @@ mod tests {
         // One note per FFT band: A2 (110 Hz), A4 (440 Hz), A6 (1760 Hz).
         for midi in [45.0, 69.0, 93.0] {
             let track = sine(midi_to_freq(midi), 1.0, 2.0, 44100);
-            let spec = Spectrogram::start(track, Analysis::default(), || {});
+            let spec = Spectrogram::start(track, Job::default(), || {});
             wait(&spec);
             let col = spec.cols / 2;
             let column: Vec<u8> = spec.with_data(|d| d[col * ROWS..(col + 1) * ROWS].to_vec());
             let (row, &value) = column.iter().enumerate().max_by_key(|(_, v)| **v).unwrap();
-            let pitch = PITCH_MIN + (row as f64 + 0.5) / ROWS_PER_SEMITONE as f64;
+            let pitch = spec.row_pitch(row);
             assert!((pitch - midi).abs() <= 0.25, "peak at pitch {pitch}, expected {midi}");
             // A full-scale sine is 0 dB = 255, within a dB or so.
             assert!(value >= 250, "peak level {value} for midi {midi}");
@@ -327,7 +394,7 @@ mod tests {
             Analysis { multi_resolution: false, window: WindowShape::BlackmanHarris, resolution: Resolution::High, ..Analysis::default() },
         ];
         for analysis in settings {
-            let spec = Spectrogram::start(track.clone(), analysis, || {});
+            let spec = Spectrogram::start(track.clone(), Job { analysis, ..Job::default() }, || {});
             wait(&spec);
             assert_eq!(spec.hop, analysis.time_step.hop());
             let col = spec.cols / 2;
@@ -341,11 +408,47 @@ mod tests {
     }
 
     #[test]
+    fn linear_grid_and_channels() {
+        // 440 Hz in the left channel only, 1760 Hz in both.
+        let (sr, n) = (44100.0f64, 66150);
+        let tone = |hz: f64, i: usize| (std::f64::consts::TAU * hz * i as f64 / sr).sin() as f32;
+        let samples: Vec<f32> = (0..n).flat_map(|i| [0.5 * tone(440.0, i) + 0.4 * tone(1760.0, i), 0.4 * tone(1760.0, i)]).collect();
+        let track = Arc::new(Track { path: Default::default(), name: "t".into(), sample_rate: 44100, samples });
+        let level_at = |job: Job, hz: f64| -> u8 {
+            let spec = Spectrogram::start(track.clone(), job, || {});
+            wait(&spec);
+            assert_eq!(spec.rows, if job.linear { LINEAR_ROWS } else { ROWS });
+            let midi = 69.0 + 12.0 * (hz / 440.0).log2();
+            let row = ((1.0 - spec.v(midi)) * spec.rows as f32) as usize;
+            assert!((spec.row_pitch(row) - midi).abs() < 0.5);
+            let col = spec.cols / 2;
+            spec.with_data(|d| d[col * spec.rows + row])
+        };
+        let job = |linear: bool, channel: Channel| Job { linear, channel, ..Job::default() };
+        for linear in [false, true] {
+            // 0.5 in one channel is 0.25 (-12 dB) in the mix and in the side.
+            assert!(level_at(job(linear, Channel::Left), 440.0) > 235);
+            assert!(level_at(job(linear, Channel::Right), 440.0) < 60);
+            let mix = level_at(job(linear, Channel::Mix), 440.0);
+            assert!((220..=232).contains(&mix), "mix level {mix}");
+            // The centred tone is in the mix but cancels in the side.
+            assert!(level_at(job(linear, Channel::Mix), 1760.0) > 230);
+            assert!(level_at(job(linear, Channel::Side), 1760.0) < 60);
+            assert!(level_at(job(linear, Channel::Side), 440.0) > 215);
+        }
+        // On the linear grid a row is the same width in hertz everywhere.
+        let spec = Spectrogram::start(track.clone(), job(true, Channel::Mix), || {});
+        let hz = |row: usize| midi_to_freq(spec.row_pitch(row));
+        assert!(((hz(901) - hz(900)) - (hz(11) - hz(10))).abs() < 1e-6);
+        spec.cancel();
+    }
+
+    #[test]
     fn peaks_match_brute_force() {
         let track = sine(3.0, 0.8, 4.0, 8000);
         let peaks = Peaks::build(&track);
         for (a, b) in [(0.0, 32000.0), (100.0, 150.0), (1234.0, 9000.0), (31000.0, 40000.0), (5.5, 5.6)] {
-            let (lo, hi) = peaks.range(&track, a, b);
+            let (lo, hi) = peaks.range(&track, Channel::Mix, a, b);
             let (ia, ib) = (a.floor() as i64, (b.ceil() as i64).min(32000));
             let want_lo = (ia..ib).map(|i| track.mono(i)).fold(f32::MAX, f32::min);
             let want_hi = (ia..ib).map(|i| track.mono(i)).fold(f32::MIN, f32::max);

@@ -129,6 +129,13 @@ impl Track {
         }
     }
 
+    /// One channel (or mix) of one frame; silence outside the track.
+    #[inline]
+    pub fn channel(&self, frame: i64, channel: crate::session::Channel) -> f32 {
+        let [left, right] = self.stereo(frame);
+        channel.of(left, right)
+    }
+
     /// One stereo frame; silence outside the track.
     #[inline]
     pub fn stereo(&self, frame: i64) -> [f32; 2] {

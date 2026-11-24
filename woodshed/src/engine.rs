@@ -33,6 +33,8 @@ pub struct Engine {
     /// like a tape machine and pitch follows it.
     keep_pitch: bool,
     volume: f32,
+    /// Output channels as mixes of the track's: isolation, width, balance.
+    stereo: [[f32; 2]; 2],
     /// Loop region in source frames.
     loop_region: Option<(f64, f64)>,
     /// Silence between loop repeats, seconds.
@@ -84,6 +86,7 @@ impl Engine {
             speed: 1.0,
             keep_pitch: true,
             volume: 0.8,
+            stereo: [[1.0, 0.0], [0.0, 1.0]],
             loop_region: None,
             loop_gap: 0.0,
             out_rate: 48000.0,
@@ -236,6 +239,10 @@ impl Engine {
 
     pub fn set_speed(&mut self, speed: f64) {
         self.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+    }
+
+    pub fn set_stereo(&mut self, matrix: [[f32; 2]; 2]) {
+        self.stereo = matrix;
     }
 
     pub fn set_volume(&mut self, volume: f32) {
@@ -392,6 +399,8 @@ impl Engine {
                     *s = (((c3 * t + c2) * t + c1) * t + y1) * gain;
                 }
                 self.frac += ratio;
+                let m = &self.stereo;
+                s = [m[0][0] * s[0] + m[0][1] * s[1], m[1][0] * s[0] + m[1][1] * s[1]];
             }
             // The reference tone, with a short fade either side to avoid clicks.
             let target = if self.tone.is_some() { 1.0 } else { 0.0 };
@@ -688,6 +697,28 @@ mod tests {
         e.set_key_sound(None, 0);
         e.set_key(Some(69), 0.5);
         assert!((zero_crossing_freq(&render(&mut e, SR as usize / 2)[4800..]) - 440.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn stereo_matrix_shapes_the_output() {
+        // A track with a tone on the left only.
+        let n = SR as usize;
+        let samples: Vec<f32> =
+            (0..n).flat_map(|i| [(std::f32::consts::TAU * 440.0 * i as f32 / SR as f32).sin() * 0.5, 0.0]).collect();
+        let track = Arc::new(Track { path: Default::default(), name: "t".into(), sample_rate: SR, samples });
+        let peaks = |matrix: [[f32; 2]; 2]| {
+            let mut e = engine(track.clone());
+            e.set_stereo(matrix);
+            e.play();
+            let mut out = vec![0.0f32; n];
+            e.render(&mut out, 2);
+            let peak = |ch: usize| out.chunks(2).skip(2000).map(|f| f[ch].abs()).fold(0.0f32, f32::max);
+            [peak(0), peak(1)]
+        };
+        let near = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01;
+        assert!(near(peaks([[1.0, 0.0], [0.0, 1.0]]), [0.5, 0.0]));
+        assert!(near(peaks([[0.0, 1.0], [1.0, 0.0]]), [0.0, 0.5])); // swapped
+        assert!(near(peaks([[0.5, 0.5], [0.5, 0.5]]), [0.25, 0.25])); // mid
     }
 
     #[test]
