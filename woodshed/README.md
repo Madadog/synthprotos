@@ -129,6 +129,9 @@ it has its own `Cargo.lock`.
 | `Ctrl`+drag | Select a loop region; drag its edges to adjust |
 | Click the piano | Play that note |
 | Drag the divider | Resize waveform against spectrogram |
+
+Double-clicking any slider puts it back to its default. In Preferences, a
+Reset button appears beside each setting that has been changed.
 | Right-drag | Pan |
 | Scroll | Zoom the timeline (`Shift`: pan) |
 | `Alt`+scroll | Zoom the pitch axis |

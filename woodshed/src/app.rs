@@ -1227,63 +1227,89 @@ impl App {
                 egui::Grid::new(id).num_columns(2).spacing([16.0, 6.0]).min_col_width(150.0).show(ui, |ui| contents(ui));
             };
             let settings = &mut self.settings;
+            let defaults = Settings::default();
 
             ui.label(RichText::new("Playback").strong());
             let mut keep_pitch = settings.keep_pitch;
             grid(ui, "playback", &mut |ui| {
                 ui.label("Speed changes");
-                ui.checkbox(&mut keep_pitch, "Keep pitch (time-stretch)")
-                    .on_hover_text("Off: plain resampling like a tape machine, so pitch follows speed");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut keep_pitch, "Keep pitch (time-stretch)")
+                        .on_hover_text("Off: plain resampling like a tape machine, so pitch follows speed");
+                    reset_button(ui, &mut keep_pitch, defaults.keep_pitch);
+                });
                 ui.end_row();
                 ui.label("When a track ends");
-                ui.checkbox(&mut settings.auto_advance, "Play the next one in the playlist")
-                    .on_hover_text("Unless a loop is on");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut settings.auto_advance, "Play the next one in the playlist")
+                        .on_hover_text("Unless a loop is on");
+                    reset_button(ui, &mut settings.auto_advance, defaults.auto_advance);
+                });
                 ui.end_row();
                 ui.label("Gap between loop repeats");
-                ui.add(egui::Slider::new(&mut settings.loop_gap, 0.0..=4.0).step_by(0.25).suffix(" s"));
+                ui.horizontal(|ui| {
+                    slider(ui, &mut settings.loop_gap, Settings::default().loop_gap, |v| egui::Slider::new(v, 0.0..=4.0).step_by(0.25).suffix(" s"));
+                    reset_button(ui, &mut settings.loop_gap, defaults.loop_gap);
+                });
                 ui.end_row();
                 ui.label("Arrow keys seek");
-                ui.add(egui::Slider::new(&mut settings.seek_step, 0.5..=10.0).step_by(0.5).suffix(" s"));
+                ui.horizontal(|ui| {
+                    slider(ui, &mut settings.seek_step, Settings::default().seek_step, |v| egui::Slider::new(v, 0.5..=10.0).step_by(0.5).suffix(" s"));
+                    reset_button(ui, &mut settings.seek_step, defaults.seek_step);
+                });
                 ui.end_row();
                 ui.label("Shift + arrow keys seek");
-                ui.add(egui::Slider::new(&mut settings.seek_step_large, 5.0..=60.0).step_by(5.0).suffix(" s"));
+                ui.horizontal(|ui| {
+                    slider(ui, &mut settings.seek_step_large, Settings::default().seek_step_large, |v| egui::Slider::new(v, 5.0..=60.0).step_by(5.0).suffix(" s"));
+                    reset_button(ui, &mut settings.seek_step_large, defaults.seek_step_large);
+                });
                 ui.end_row();
             });
 
             section(ui, "Display");
             grid(ui, "display", &mut |ui| {
                 ui.label("Follow the playhead");
-                egui::ComboBox::from_id_salt("follow").width(190.0).selected_text(settings.follow.label()).show_ui(
-                    ui,
-                    |ui| {
-                        for follow in Follow::ALL {
-                            ui.selectable_value(&mut settings.follow, follow, follow.label());
-                        }
-                    },
-                );
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("follow").width(190.0).selected_text(settings.follow.label()).show_ui(
+                        ui,
+                        |ui| {
+                            for follow in Follow::ALL {
+                                ui.selectable_value(&mut settings.follow, follow, follow.label());
+                            }
+                        },
+                    );
+                    reset_button(ui, &mut settings.follow, defaults.follow);
+                });
                 ui.end_row();
                 ui.label("Playlist");
                 let hint = "On: the playlist is a view like the waveform and spectrogram (V cycles to it, F makes \
                             it full screen), shown as a table with title, artist, album and length columns that \
                             sort the playlist when clicked.\nOff: a compact list in the sidebar";
-                if ui.checkbox(&mut settings.playlist_view, "Show as a full view with metadata columns").on_hover_text(hint).changed() {
-                    // Show the result of the change straight away.
-                    if settings.playlist_view {
-                        settings.view = ViewMode::Playlist;
-                    } else {
-                        settings.sidebar = SidebarTab::Playlist;
+                ui.horizontal(|ui| {
+                    let toggled =
+                        ui.checkbox(&mut settings.playlist_view, "Show as a full view with metadata columns").on_hover_text(hint).changed();
+                    if toggled | reset_button(ui, &mut settings.playlist_view, defaults.playlist_view) {
+                        // Show the result of the change straight away.
+                        if settings.playlist_view {
+                            settings.view = ViewMode::Playlist;
+                        } else {
+                            settings.sidebar = SidebarTab::Playlist;
+                        }
                     }
-                }
+                });
                 ui.end_row();
                 ui.label("Interface size");
-                egui::ComboBox::from_id_salt("scale")
-                    .width(190.0)
-                    .selected_text(format!("{:.0}%", settings.ui_scale * 100.0))
-                    .show_ui(ui, |ui| {
-                        for scale in [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0] {
-                            ui.selectable_value(&mut settings.ui_scale, scale, format!("{:.0}%", scale * 100.0));
-                        }
-                    });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("scale")
+                        .width(190.0)
+                        .selected_text(format!("{:.0}%", settings.ui_scale * 100.0))
+                        .show_ui(ui, |ui| {
+                            for scale in [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0] {
+                                ui.selectable_value(&mut settings.ui_scale, scale, format!("{:.0}%", scale * 100.0));
+                            }
+                        });
+                    reset_button(ui, &mut settings.ui_scale, defaults.ui_scale);
+                });
                 ui.end_row();
             });
 
@@ -1314,18 +1340,22 @@ impl App {
                         ui.selectable_value(&mut settings.key_sound, KeySound::SoundFont, "SoundFont instrument")
                             .on_disabled_hover_text("Needs a SoundFont");
                     });
+                    reset_button(ui, &mut settings.key_sound, defaults.key_sound);
                 });
                 ui.end_row();
                 ui.label("Piano instrument");
-                ui.add_enabled_ui(has_font && settings.key_sound == KeySound::SoundFont, |ui| {
-                    egui::ComboBox::from_id_salt("key-program")
-                        .width(190.0)
-                        .selected_text(midi::GM_NAMES[settings.key_program as usize & 127])
-                        .show_ui(ui, |ui| {
-                            for (program, name) in midi::GM_NAMES.iter().enumerate() {
-                                ui.selectable_value(&mut settings.key_program, program as u8, *name);
-                            }
-                        });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(has_font && settings.key_sound == KeySound::SoundFont, |ui| {
+                        egui::ComboBox::from_id_salt("key-program")
+                            .width(190.0)
+                            .selected_text(midi::GM_NAMES[settings.key_program as usize & 127])
+                            .show_ui(ui, |ui| {
+                                for (program, name) in midi::GM_NAMES.iter().enumerate() {
+                                    ui.selectable_value(&mut settings.key_program, program as u8, *name);
+                                }
+                            });
+                    });
+                    reset_button(ui, &mut settings.key_program, defaults.key_program);
                 });
                 ui.end_row();
             });
@@ -1379,9 +1409,9 @@ impl App {
                 },
             );
             theme_swatch(ui, settings.theme, ui.available_width() - 8.0);
-            ui.add(egui::Slider::new(&mut settings.range_db, 30.0..=100.0).step_by(1.0).suffix(" dB").text("range"))
+            slider(ui, &mut settings.range_db, Settings::default().range_db, |v| egui::Slider::new(v, 30.0..=100.0).step_by(1.0).suffix(" dB").text("range"))
                 .on_hover_text("Dynamic range shown: lower hides quiet detail");
-            ui.add(egui::Slider::new(&mut settings.brightness_db, -20.0..=30.0).step_by(1.0).suffix(" dB").text("brightness"))
+            slider(ui, &mut settings.brightness_db, Settings::default().brightness_db, |v| egui::Slider::new(v, -20.0..=30.0).step_by(1.0).suffix(" dB").text("brightness"))
                 .on_hover_text("Raise to bring out quiet notes, lower if loud ones wash out");
             let combo_width = ui.available_width() - 70.0;
             ui.horizontal(|ui| {
@@ -1407,7 +1437,7 @@ impl App {
                     }
                 },
             );
-            ui.add(egui::Slider::new(&mut settings.contrast, 0.4..=2.5).step_by(0.05).text("contrast"))
+            slider(ui, &mut settings.contrast, Settings::default().contrast, |v| egui::Slider::new(v, 0.4..=2.5).step_by(0.05).text("contrast"))
                 .on_hover_text("Above 1 darkens the quiet parts so peaks stand out; below 1 lifts them");
             ui.checkbox(&mut settings.smooth, "Smooth").on_hover_text("Blend between cells instead of showing them as blocks");
             ui.checkbox(&mut settings.octave_lines, "Octave lines").on_hover_text("A line at every C");
@@ -1473,12 +1503,12 @@ impl App {
                 "Off: what is coming falls from the top towards the piano.\n\
                  On: what has been played rises from the piano",
             );
-            ui.add(egui::Slider::new(&mut settings.tone_volume, 0.0..=1.0).show_value(false).text("piano tone volume"))
+            slider(ui, &mut settings.tone_volume, Settings::default().tone_volume, |v| egui::Slider::new(v, 0.0..=1.0).show_value(false).text("piano tone volume"))
                 .on_hover_text("Click or drag on the piano to hear a note");
             show_piano_range = ui.button("Show all 88 keys").clicked();
         });
         egui::CollapsingHeader::new(RichText::new("Waveform").strong()).id_salt("waveform-settings").show(ui, |ui| {
-            ui.add(egui::Slider::new(&mut settings.wave_zoom, 1.0..=32.0).logarithmic(true).suffix("×").text("zoom"))
+            slider(ui, &mut settings.wave_zoom, Settings::default().wave_zoom, |v| egui::Slider::new(v, 1.0..=32.0).logarithmic(true).suffix("×").text("zoom"))
                 .on_hover_text("Magnify quiet passages; loud ones clip at the edge");
             ui.checkbox(&mut settings.wave_log, "Decibel scale")
                 .on_hover_text("Shows level over a 60 dB range, so quiet detail is visible next to loud");
@@ -1489,7 +1519,7 @@ impl App {
                  Each trace starts where the signal crosses zero going up, so steady notes stand still",
             );
             ui.add_enabled_ui(settings.oscilloscope, |ui| {
-                ui.add(egui::Slider::new(&mut settings.scope_ms, 2.0..=200.0).logarithmic(true).suffix(" ms").text("length"))
+                slider(ui, &mut settings.scope_ms, Settings::default().scope_ms, |v| egui::Slider::new(v, 2.0..=200.0).logarithmic(true).suffix(" ms").text("length"))
                     .on_hover_text("How much audio one trace shows: shorter for high notes, longer for low");
                 ui.checkbox(&mut settings.scope_xy, "Left against right")
                     .on_hover_text("A vectorscope: mono sound is a vertical line, wide stereo spreads sideways,\nout-of-phase sound lies flat");
@@ -1522,9 +1552,9 @@ impl App {
                      Mid is the opposite",
                 );
             });
-            ui.add(egui::Slider::new(&mut stereo.balance, -1.0..=1.0).step_by(0.05).text("balance"))
+            slider(ui, &mut stereo.balance, Stereo::default().balance, |v| egui::Slider::new(v, -1.0..=1.0).step_by(0.05).text("balance"))
                 .on_hover_text("Left to right. Turns down the far side");
-            ui.add(egui::Slider::new(&mut stereo.width, 0.0..=2.0).step_by(0.05).text("width")).on_hover_text(
+            slider(ui, &mut stereo.width, Stereo::default().width, |v| egui::Slider::new(v, 0.0..=2.0).step_by(0.05).text("width")).on_hover_text(
                 "Mid/side processing: scales the side signal.\n0 is mono, 1 is unchanged, 2 is twice as wide",
             );
             ui.checkbox(&mut stereo.invert_right, "Invert right channel")
@@ -1611,7 +1641,10 @@ impl App {
             let slider = egui::Slider::new(&mut percent, MIN_SPEED * 100.0..=MAX_SPEED * 100.0)
                 .step_by(1.0)
                 .suffix("%");
-            if ui.add(slider).on_hover_text("Playback speed (↑ / ↓)").changed() {
+            let speed = ui.add(slider).on_hover_text("Playback speed (↑ / ↓). Double-click for normal speed");
+            if double_clicked(ui, &speed) {
+                self.set_speed(1.0);
+            } else if speed.changed() {
                 self.set_speed(percent / 100.0);
             }
             if ui.add_enabled(self.session.speed != 1.0, egui::Button::new("1×")).on_hover_text("Back to normal speed").clicked() {
@@ -1631,7 +1664,11 @@ impl App {
                 }
                 ui.separator();
                 let slider = egui::Slider::new(&mut self.settings.volume, 0.0..=1.0).show_value(false);
-                if ui.add(slider).changed() {
+                let volume = ui.add(slider);
+                if double_clicked(ui, &volume) {
+                    self.settings.volume = Settings::default().volume;
+                }
+                if volume.changed() || double_clicked(ui, &volume) {
                     self.engine.lock().unwrap().set_volume(self.settings.volume);
                 }
                 ui.label("Volume");
@@ -1710,6 +1747,7 @@ impl App {
             ("Ctrl+drag", "Select a loop region (drag its edges to adjust)"),
             ("Click the piano", "Play that note"),
             ("Drag the divider", "Resize waveform against spectrogram"),
+            ("Double-click a slider", "Put it back to its default"),
             ("Right-drag", "Pan the display"),
             ("Scroll", "Zoom the timeline (Shift: pan)"),
             ("Alt+scroll", "Zoom the pitch axis"),
@@ -1847,6 +1885,43 @@ enum Icon {
     Pause,
     Previous,
     Next,
+}
+
+/// Whether a widget was just double-clicked. Sliders only sense drags, so
+/// this looks at the pointer itself; a double click that lands in a value
+/// box being typed into does not count.
+fn double_clicked(ui: &Ui, response: &egui::Response) -> bool {
+    response.contains_pointer()
+        && !ui.ctx().text_edit_focused()
+        && ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+}
+
+/// A slider that goes back to `default` when double-clicked.
+fn slider<T: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut T,
+    default: T,
+    make: impl for<'a> FnOnce(&'a mut T) -> egui::Slider<'a>,
+) -> egui::Response {
+    let mut response = ui.add(make(value));
+    if double_clicked(ui, &response) {
+        *value = default;
+        response.mark_changed();
+    }
+    response
+}
+
+/// In the preferences: a small button that puts a changed setting back to
+/// its default, shown only while the setting differs from it.
+fn reset_button<T: PartialEq>(ui: &mut Ui, value: &mut T, default: T) -> bool {
+    if *value == default {
+        return false;
+    }
+    let clicked = ui.small_button("Reset").on_hover_text("Back to the default").clicked();
+    if clicked {
+        *value = default;
+    }
+    clicked
 }
 
 /// A strip showing a spectrogram theme from quiet to loud.
