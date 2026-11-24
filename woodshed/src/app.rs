@@ -17,7 +17,7 @@ use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
 use crate::metadata::{self, Meta, MetaCache, SortColumn};
 use crate::midi::{self, MidiSong};
 use crate::playlist_io;
-use crate::session::{Analysis, LevelScale, Resolution, TimeStep, WindowShape};
+use crate::session::{Analysis, FreqScale, LevelScale, Resolution, TimeStep, WindowShape};
 use crate::session::{Follow, KeySound, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
 use crate::track::{self, Track};
 
@@ -1373,6 +1373,21 @@ impl App {
             ui.add(egui::Slider::new(&mut settings.brightness_db, -20.0..=30.0).step_by(1.0).suffix(" dB").text("brightness"))
                 .on_hover_text("Raise to bring out quiet notes, lower if loud ones wash out");
             let combo_width = ui.available_width() - 70.0;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("freq-scale").width(combo_width).selected_text(settings.freq_scale.label()).show_ui(
+                    ui,
+                    |ui| {
+                        for scale in FreqScale::ALL {
+                            ui.selectable_value(&mut settings.freq_scale, scale, scale.label());
+                        }
+                    },
+                );
+                ui.label("axis").on_hover_text(
+                    "How frequency is spread along the pitch axis.\n\
+                     Pitch: every semitone the same size. Mel: closer to how pitch is heard, compressing the top.\n\
+                     Linear: every hertz the same size, so harmonics are evenly spaced",
+                );
+            });
             egui::ComboBox::from_id_salt("level-scale").width(combo_width).selected_text(settings.level_scale.label()).show_ui(
                 ui,
                 |ui| {

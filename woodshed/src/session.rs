@@ -312,6 +312,51 @@ impl LevelScale {
     }
 }
 
+/// How frequency is laid out along the spectrogram's pitch axis.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Debug)]
+pub enum FreqScale {
+    /// Every semitone the same size, like a piano roll.
+    #[default]
+    Pitch,
+    /// The mel scale: roughly linear below 1 kHz and logarithmic above.
+    Mel,
+    /// Every hertz the same size, like a conventional spectrogram.
+    Linear,
+}
+
+impl FreqScale {
+    pub const ALL: [FreqScale; 3] = [FreqScale::Pitch, FreqScale::Mel, FreqScale::Linear];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FreqScale::Pitch => "Pitch (logarithmic)",
+            FreqScale::Mel => "Mel",
+            FreqScale::Linear => "Linear (hertz)",
+        }
+    }
+
+    /// Position along the axis of a (fractional) MIDI pitch, in units that
+    /// are evenly spaced on screen.
+    pub fn warp(self, midi: f64) -> f64 {
+        let hz = 440.0 * 2f64.powf((midi - 69.0) / 12.0);
+        match self {
+            FreqScale::Pitch => midi,
+            FreqScale::Mel => 2595.0 * (1.0 + hz / 700.0).log10(),
+            FreqScale::Linear => hz,
+        }
+    }
+
+    /// The MIDI pitch at an axis position; the inverse of `warp`.
+    pub fn unwarp(self, position: f64) -> f64 {
+        let hz = match self {
+            FreqScale::Pitch => return position,
+            FreqScale::Mel => 700.0 * (10f64.powf(position / 2595.0) - 1.0),
+            FreqScale::Linear => position,
+        };
+        69.0 + 12.0 * (hz.max(1.0) / 440.0).log2()
+    }
+}
+
 /// What clicking the piano plays.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KeySound {
@@ -342,6 +387,7 @@ pub struct Settings {
     pub range_db: f32,
     pub analysis: Analysis,
     pub level_scale: LevelScale,
+    pub freq_scale: FreqScale,
     /// Exponent applied to the colour position: above 1 darkens the quiet
     /// parts, below 1 lifts them.
     pub contrast: f32,
@@ -405,6 +451,7 @@ impl Default for Settings {
             range_db: 70.0,
             analysis: Analysis::default(),
             level_scale: LevelScale::default(),
+            freq_scale: FreqScale::default(),
             contrast: 1.0,
             brightness_db: 0.0,
             smooth: true,
@@ -721,6 +768,26 @@ mod tests {
             assert!((window.value(512, 1024) - 1.0).abs() < 1e-3);
             assert!(window.value(0, 1024) < 0.1);
         }
+    }
+
+    #[test]
+    fn frequency_scales() {
+        for scale in FreqScale::ALL {
+            for midi in [21.0, 60.0, 69.5, 108.0] {
+                assert!((scale.unwarp(scale.warp(midi)) - midi).abs() < 1e-9, "{scale:?} {midi}");
+            }
+            assert!(scale.warp(61.0) > scale.warp(60.0));
+        }
+        assert_eq!(FreqScale::Pitch.warp(60.0), 60.0);
+        assert!((FreqScale::Linear.warp(69.0) - 440.0).abs() < 1e-9);
+        // 1000 Hz is 1000 mel by definition (to within the formula's rounding).
+        let midi_1k = 69.0 + 12.0 * (1000.0f64 / 440.0).log2();
+        assert!((FreqScale::Mel.warp(midi_1k) - 1000.0).abs() < 0.1);
+        // An octave is the same size anywhere on the pitch scale, and doubles on the linear one.
+        let octave = |scale: FreqScale, from: f64| scale.warp(from + 12.0) - scale.warp(from);
+        assert!((octave(FreqScale::Linear, 60.0) / octave(FreqScale::Linear, 48.0) - 2.0).abs() < 1e-9);
+        let ratio = octave(FreqScale::Mel, 60.0) / octave(FreqScale::Mel, 48.0);
+        assert!(ratio > 1.3 && ratio < 2.0, "mel octave ratio {ratio}");
     }
 
     #[test]

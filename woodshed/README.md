@@ -24,8 +24,8 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
 - **Reference tones**: click or drag on the piano to hear that note, as a
   sine tone or, if set in Preferences, as any instrument from the SoundFont.
 - **Display settings** fold out at the bottom of the sidebar. Spectrogram:
-  theme, range, brightness, level scale (decibels, square root or linear)
-  and contrast, smoothing, octave and semitone lines, and markers for the
+  theme, frequency axis (pitch, mel or linear hertz), range, brightness,
+  level scale (decibels, square root or linear) and contrast, smoothing, octave and semitone lines, and markers for the
   harmonics of the pitch under the cursor. Its analysis settings set the FFT
   window length (pitch against time resolution), the time step, the window
   shape, and whether low notes get longer windows than high ones; changing

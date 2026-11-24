@@ -16,7 +16,7 @@ use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE, PITCH_MAX, PITCH_MIN,
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
 use crate::midi::{MidiSong, Note};
 use crate::pitch;
-use crate::session::{LevelScale, LoopMode, Settings, Theme, ViewMode};
+use crate::session::{FreqScale, LevelScale, LoopMode, Settings, Theme, ViewMode};
 use crate::track::Track;
 
 const RULER_HEIGHT: f32 = 38.0;
@@ -56,24 +56,46 @@ struct Axis {
     length: f32,
     lo: f64,
     hi: f64,
+    /// How values are spread along the axis. Time is always even; pitch can
+    /// be laid out by pitch, mel or hertz.
+    warp: FreqScale,
 }
 
 impl Axis {
     fn at(&self, value: f64) -> f32 {
-        self.origin + ((value - self.lo) / (self.hi - self.lo)) as f32 * self.length
+        let (w, lo, hi) = (self.warp.warp(value), self.warp.warp(self.lo), self.warp.warp(self.hi));
+        self.origin + ((w - lo) / (hi - lo)) as f32 * self.length
     }
 
     fn value(&self, coord: f32) -> f64 {
-        self.lo + ((coord - self.origin) / self.length) as f64 * (self.hi - self.lo)
+        let (lo, hi) = (self.warp.warp(self.lo), self.warp.warp(self.hi));
+        self.warp.unwarp(lo + ((coord - self.origin) / self.length) as f64 * (hi - lo))
     }
 
     fn size(&self) -> f32 {
         self.length.abs()
     }
 
-    /// Screen distance per unit of value, signed.
+    /// Screen distance per unit of value, signed (the average, on a warped axis).
     fn scale(&self) -> f64 {
         self.length as f64 / (self.hi - self.lo)
+    }
+
+    /// Screen size of one unit of value around `value`.
+    fn unit_size(&self, value: f64) -> f32 {
+        (self.at(value + 0.5) - self.at(value - 0.5)).abs()
+    }
+
+    /// The range after sliding the axis's contents by `pixels`.
+    fn panned(&self, pixels: f32) -> (f64, f64) {
+        (self.value(self.origin - pixels), self.value(self.origin + self.length - pixels))
+    }
+
+    /// The range after scaling by `factor` (> 1 shows more) about the value at `coord`.
+    fn zoomed(&self, coord: f32, factor: f32) -> (f64, f64) {
+        let ends = [self.origin, self.origin + self.length];
+        let [lo, hi] = ends.map(|end| self.value(coord + (end - coord) * factor));
+        (lo, hi)
     }
 }
 
@@ -131,20 +153,20 @@ impl Geometry {
         });
         let (lo, hi) = (view.start, view.start + view.span);
         let time = if !vertical {
-            Axis { origin: body.left(), length: body.width().max(10.0), lo, hi }
+            Axis { origin: body.left(), length: body.width().max(10.0), lo, hi, warp: FreqScale::Pitch }
         } else if settings.reverse {
             // The past rises from the piano: later is lower.
-            Axis { origin: body.top(), length: body.height().max(10.0), lo, hi }
+            Axis { origin: body.top(), length: body.height().max(10.0), lo, hi, warp: FreqScale::Pitch }
         } else {
             // What is coming falls towards the piano: later is higher.
-            Axis { origin: body.bottom(), length: -body.height().max(10.0), lo, hi }
+            Axis { origin: body.bottom(), length: -body.height().max(10.0), lo, hi, warp: FreqScale::Pitch }
         };
         let pitch = spec.map(|s| {
             let (lo, hi) = (view.pitch_lo, view.pitch_hi);
             if vertical {
-                Axis { origin: s.left(), length: s.width(), lo, hi }
+                Axis { origin: s.left(), length: s.width(), lo, hi, warp: settings.freq_scale }
             } else {
-                Axis { origin: s.bottom(), length: -s.height(), lo, hi }
+                Axis { origin: s.bottom(), length: -s.height(), lo, hi, warp: settings.freq_scale }
             }
         });
         Geometry { vertical, time, pitch, ruler, body, wave, spec, piano, timed: ruler.union(body) }
@@ -334,9 +356,7 @@ impl App {
                 (Drag::Pan, _) => {
                     self.view.start -= g.along(delta.to_pos2()) as f64 / g.time.scale();
                     if let Some(pitch) = g.pitch {
-                        let shift = g.across(delta.to_pos2()) as f64 / pitch.scale();
-                        self.view.pitch_lo -= shift;
-                        self.view.pitch_hi -= shift;
+                        (self.view.pitch_lo, self.view.pitch_hi) = pitch.panned(g.across(delta.to_pos2()));
                     }
                     self.last_pan = now;
                 }
@@ -388,18 +408,16 @@ impl App {
         if let Some(p) = hover {
             let (scroll, pinch, alt) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta() as f64, i.modifiers.alt));
             let zoom_pitch = |view: &mut View, factor: f64| {
-                if let Some(anchor) = g.pitch_at(p) {
-                    view.pitch_lo = anchor - (anchor - view.pitch_lo) * factor;
-                    view.pitch_hi = anchor + (view.pitch_hi - anchor) * factor;
+                if let Some(pitch) = g.pitch {
+                    (view.pitch_lo, view.pitch_hi) = pitch.zoomed(g.across(p), factor as f32);
                 }
             };
             let wheel = (-scroll.y as f64 * 0.004).exp();
             if over_piano(p) {
                 if let Some(pitch) = g.pitch {
                     // The wheel moves towards higher notes; sideways scrolling drags the keys.
-                    let shift = (scroll.y - scroll.x * pitch.length.signum()) as f64 / pitch.scale().abs();
-                    self.view.pitch_lo += shift;
-                    self.view.pitch_hi += shift;
+                    let pixels = -scroll.y * pitch.length.signum() + scroll.x;
+                    (self.view.pitch_lo, self.view.pitch_hi) = pitch.panned(pixels);
                 }
                 zoom_pitch(&mut self.view, 1.0 / pinch);
             } else if alt && g.spec.is_some_and(|r| r.contains(p)) {
@@ -450,9 +468,9 @@ impl App {
                 if light { Color32::from_black_alpha(alpha * 2) } else { Color32::from_white_alpha(alpha) }
             };
             let along = g.along_range(rect);
-            let key_size = pitch.scale().abs() as f32;
-            if self.settings.semitone_lines && key_size >= 5.0 {
-                for midi in pitch.lo.floor() as i32..=pitch.hi.ceil() as i32 {
+            if self.settings.semitone_lines {
+                // Only where the notes are far enough apart to tell the lines from shading.
+                for midi in (pitch.lo.floor() as i32..=pitch.hi.ceil() as i32).filter(|m| pitch.unit_size(*m as f64) >= 5.0) {
                     g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(9)));
                 }
             }
@@ -729,7 +747,7 @@ fn draw_piano(painter: &Painter, rect: Rect, axis: Axis, along_bottom: bool, hov
     const BLACK: Color32 = Color32::from_rgb(24, 24, 28);
     const LINE: Color32 = Color32::from_rgb(120, 120, 120);
     painter.rect_filled(rect, CornerRadius::ZERO, WHITE);
-    let key_size = axis.scale().abs() as f32;
+    let key_size = axis.unit_size((axis.lo + axis.hi) / 2.0);
     let hovered = hover.map(|p| p.round() as i32);
     // A key's strip, shortened to `depth` of the way from the playing surface's far end.
     let strip = |midi: i32, depth: f32| {
@@ -825,8 +843,8 @@ fn draw_midi(painter: &Painter, g: &Geometry, rect: Rect, pitch: Axis, song: &Mi
         let row = strip(pitch.at(key as f64 - 0.5), pitch.at(key as f64 + 0.5), along.min, along.max);
         painter.rect_filled(row, CornerRadius::ZERO, Color32::from_black_alpha(70));
     }
-    let key_size = pitch.scale().abs() as f32;
     for note in &song.notes {
+        let key_size = pitch.unit_size(note.key as f64);
         if note.start > g.time.hi {
             break; // sorted by start
         }
@@ -958,16 +976,23 @@ impl Tiles {
                 // along u and pitch along v, whichever way the display runs.
                 let along = |col: usize| time.at((col as f64 - 0.5) / cols_per_sec);
                 let mut mesh = egui::Mesh::with_texture(tile.texture.id());
-                for (col, u) in [(a, 0.0), (b, 1.0)] {
-                    for p in [pitch.lo, pitch.hi] {
+                // The texture's rows are even in pitch, so on a mel or hertz
+                // axis it is drawn as a stack of strips, each stretched to fit.
+                let strips: u32 = if pitch.warp == FreqScale::Pitch { 1 } else { 96 };
+                for i in 0..=strips {
+                    let p = pitch.lo + (pitch.hi - pitch.lo) * i as f64 / strips as f64;
+                    for (col, u) in [(a, 0.0), (b, 1.0)] {
                         mesh.vertices.push(egui::epaint::Vertex {
                             pos: g.point(along(col), pitch.at(p)),
                             uv: pos2(u, v(p)),
                             color: Color32::WHITE,
                         });
                     }
+                    if i > 0 {
+                        let k = i * 2;
+                        mesh.indices.extend([k - 2, k - 1, k, k - 1, k + 1, k]);
+                    }
                 }
-                mesh.indices.extend([0, 1, 2, 1, 3, 2]);
                 painter.add(Shape::mesh(mesh));
             }
         }
