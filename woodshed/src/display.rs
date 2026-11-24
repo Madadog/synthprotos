@@ -16,7 +16,7 @@ use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE, PITCH_MAX, PITCH_MIN,
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
 use crate::midi::{MidiSong, Note};
 use crate::pitch;
-use crate::session::{LoopMode, Settings, Theme, ViewMode};
+use crate::session::{LevelScale, LoopMode, Settings, Theme, ViewMode};
 use crate::track::Track;
 
 const RULER_HEIGHT: f32 = 38.0;
@@ -860,6 +860,9 @@ struct Look {
     peak: u8,
     range_db: u32,
     brightness_db: i32,
+    scale: LevelScale,
+    /// Hundredths, so the look can be compared exactly.
+    contrast: i32,
     theme: Theme,
     smooth: bool,
 }
@@ -898,6 +901,8 @@ impl Tiles {
             peak: spec.peak(),
             range_db: settings.range_db as u32,
             brightness_db: settings.brightness_db as i32,
+            scale: settings.level_scale,
+            contrast: (settings.contrast * 100.0).round() as i32,
             theme: settings.theme,
             smooth: settings.smooth,
         };
@@ -1007,9 +1012,10 @@ fn build_tile(spec: &Spectrogram, level: u32, index: usize, lut: &[Color32; 256]
 fn colour_table(look: &Look) -> [Color32; 256] {
     let per_db = 255.0 / DB_RANGE;
     let top = look.peak.max(1) as f32 - look.brightness_db as f32 * per_db;
-    let span = look.range_db as f32 * per_db;
+    let range = look.range_db as f32;
     std::array::from_fn(|value| {
-        let [r, g, b] = look.theme.colour((value as f32 - (top - span)) / span);
+        let below_top = (top - value as f32) / per_db;
+        let [r, g, b] = look.theme.colour(look.scale.position(below_top, range, look.contrast as f32 / 100.0));
         Color32::from_rgb(r, g, b)
     })
 }

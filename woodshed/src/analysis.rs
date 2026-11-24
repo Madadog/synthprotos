@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use realfft::RealFftPlanner;
 
 use crate::pitch::midi_to_freq;
+use crate::session::Analysis;
 use crate::track::Track;
 
 // ---------------------------------------------------------------- waveform
@@ -112,10 +113,10 @@ struct RowMap {
 impl Spectrogram {
     /// Allocate the spectrogram and start computing it in the background.
     /// `wake` is called whenever more columns become available.
-    pub fn start(track: Arc<Track>, wake: impl Fn() + Send + Sync + 'static) -> Arc<Spectrogram> {
+    pub fn start(track: Arc<Track>, analysis: Analysis, wake: impl Fn() + Send + Sync + 'static) -> Arc<Spectrogram> {
         let scale = (track.sample_rate as f64 / 48000.0).ceil().max(1.0) as usize;
         let scale = scale.next_power_of_two();
-        let hop = 512 * scale;
+        let hop = analysis.time_step.hop() * scale;
         let cols = track.frames().div_ceil(hop).max(1);
         let blocks = cols.div_ceil(BLOCK);
         let spec = Arc::new(Spectrogram {
@@ -133,7 +134,7 @@ impl Spectrogram {
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1)).clamp(1, 6);
         for _ in 0..threads {
             let (spec, track, next_block, wake) = (spec.clone(), track.clone(), next_block.clone(), wake.clone());
-            std::thread::spawn(move || spec.worker(&track, scale, &next_block, &*wake));
+            std::thread::spawn(move || spec.worker(&track, scale, analysis, &next_block, &*wake));
         }
         spec
     }
@@ -167,14 +168,16 @@ impl Spectrogram {
         f(&self.data.read().unwrap())
     }
 
-    fn worker(&self, track: &Track, scale: usize, next_block: &AtomicUsize, wake: &dyn Fn()) {
+    fn worker(&self, track: &Track, scale: usize, analysis: Analysis, next_block: &AtomicUsize, wake: &dyn Fn()) {
         let sr = track.sample_rate as f64;
-        let sizes = [16384 * scale, 8192 * scale, 4096 * scale];
+        // Longest window first: it serves the lowest notes.
+        let shortest = analysis.resolution.window() * scale;
+        let sizes: Vec<usize> = if analysis.multi_resolution { vec![shortest * 4, shortest * 2, shortest] } else { vec![shortest * 2] };
         let mut planner = RealFftPlanner::<f32>::new();
         let ffts: Vec<_> = sizes.iter().map(|&n| planner.plan_fft_forward(n)).collect();
         let windows: Vec<Vec<f32>> = sizes
             .iter()
-            .map(|&n| (0..n).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos()).collect())
+            .map(|&n| (0..n).map(|i| analysis.window.value(i, n)).collect())
             .collect();
         // dB offset so that a full-scale sine reads 0 dB whatever the FFT size.
         let offsets: Vec<f32> = windows.iter().map(|w| 20.0 * (2.0 / w.iter().sum::<f32>()).log10()).collect();
@@ -205,6 +208,9 @@ impl Spectrogram {
                 // Position on a scale where 0, 1, 2 are the three FFT sizes.
                 let octaves = (midi_to_freq(pitch) / 250.0).log2();
                 let band = (octaves.clamp(-0.5, 0.5) + 0.5) + ((octaves - 2.0).clamp(-0.5, 0.5) + 0.5);
+                if sizes.len() == 1 {
+                    return Some((map(0, pitch)?, map(0, pitch)?, 0.0));
+                }
                 let low = (band.floor() as usize).min(sizes.len() - 2);
                 Some((map(low, pitch)?, map(low + 1, pitch)?, (band - low as f64) as f32))
             })
@@ -297,7 +303,7 @@ mod tests {
         // One note per FFT band: A2 (110 Hz), A4 (440 Hz), A6 (1760 Hz).
         for midi in [45.0, 69.0, 93.0] {
             let track = sine(midi_to_freq(midi), 1.0, 2.0, 44100);
-            let spec = Spectrogram::start(track, || {});
+            let spec = Spectrogram::start(track, Analysis::default(), || {});
             wait(&spec);
             let col = spec.cols / 2;
             let column: Vec<u8> = spec.with_data(|d| d[col * ROWS..(col + 1) * ROWS].to_vec());
@@ -307,6 +313,30 @@ mod tests {
             // A full-scale sine is 0 dB = 255, within a dB or so.
             assert!(value >= 250, "peak level {value} for midi {midi}");
             assert_eq!(spec.peak(), column.iter().copied().max().unwrap().max(spec.peak()));
+        }
+    }
+
+    #[test]
+    fn every_analysis_setting_finds_the_note() {
+        use crate::session::{Resolution, TimeStep, WindowShape};
+        let track = sine(440.0, 1.0, 1.5, 44100);
+        let settings = [
+            Analysis { resolution: Resolution::Low, time_step: TimeStep::Coarse, ..Analysis::default() },
+            Analysis { resolution: Resolution::VeryHigh, time_step: TimeStep::Fine, ..Analysis::default() },
+            Analysis { multi_resolution: false, window: WindowShape::Hamming, ..Analysis::default() },
+            Analysis { multi_resolution: false, window: WindowShape::BlackmanHarris, resolution: Resolution::High, ..Analysis::default() },
+        ];
+        for analysis in settings {
+            let spec = Spectrogram::start(track.clone(), analysis, || {});
+            wait(&spec);
+            assert_eq!(spec.hop, analysis.time_step.hop());
+            let col = spec.cols / 2;
+            let column: Vec<u8> = spec.with_data(|d| d[col * ROWS..(col + 1) * ROWS].to_vec());
+            let (row, &value) = column.iter().enumerate().max_by_key(|(_, v)| **v).unwrap();
+            let pitch = PITCH_MIN + (row as f64 + 0.5) / ROWS_PER_SEMITONE as f64;
+            assert!((pitch - 69.0).abs() <= 0.25, "peak at pitch {pitch}");
+            // Full scale reads 0 dB whatever the window.
+            assert!(value >= 250, "peak level {value}");
         }
     }
 

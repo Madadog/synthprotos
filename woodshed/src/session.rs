@@ -150,6 +150,168 @@ impl Theme {
     }
 }
 
+/// How finely the spectrogram resolves pitch: the length of its FFT windows.
+/// Longer windows separate close notes better but smear them in time.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Resolution {
+    Low,
+    #[default]
+    Normal,
+    High,
+    VeryHigh,
+}
+
+impl Resolution {
+    pub const ALL: [Resolution; 4] = [Resolution::Low, Resolution::Normal, Resolution::High, Resolution::VeryHigh];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Resolution::Low => "Low (sharper timing)",
+            Resolution::Normal => "Normal",
+            Resolution::High => "High",
+            Resolution::VeryHigh => "Very high (sharper pitch)",
+        }
+    }
+
+    /// Samples in the shortest window, at 44.1 or 48 kHz.
+    pub fn window(self) -> usize {
+        match self {
+            Resolution::Low => 2048,
+            Resolution::Normal => 4096,
+            Resolution::High => 8192,
+            Resolution::VeryHigh => 16384,
+        }
+    }
+}
+
+/// How often the spectrogram takes a column.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimeStep {
+    Coarse,
+    #[default]
+    Normal,
+    Fine,
+    VeryFine,
+}
+
+impl TimeStep {
+    pub const ALL: [TimeStep; 4] = [TimeStep::Coarse, TimeStep::Normal, TimeStep::Fine, TimeStep::VeryFine];
+
+    /// Samples between columns, at 44.1 or 48 kHz.
+    pub fn hop(self) -> usize {
+        match self {
+            TimeStep::Coarse => 1024,
+            TimeStep::Normal => 512,
+            TimeStep::Fine => 256,
+            TimeStep::VeryFine => 128,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeStep::Coarse => "Coarse (about 22 ms)",
+            TimeStep::Normal => "Normal (about 11 ms)",
+            TimeStep::Fine => "Fine (about 5 ms)",
+            TimeStep::VeryFine => "Very fine (about 3 ms)",
+        }
+    }
+}
+
+/// The FFT window shape: a trade between sharp peaks and low leakage.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WindowShape {
+    #[default]
+    Hann,
+    Hamming,
+    BlackmanHarris,
+}
+
+impl WindowShape {
+    pub const ALL: [WindowShape; 3] = [WindowShape::Hann, WindowShape::Hamming, WindowShape::BlackmanHarris];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowShape::Hann => "Hann",
+            WindowShape::Hamming => "Hamming (narrower peaks)",
+            WindowShape::BlackmanHarris => "Blackman-Harris (cleanest)",
+        }
+    }
+
+    /// The window's value at `i` of `n` samples.
+    pub fn value(self, i: usize, n: usize) -> f32 {
+        let x = std::f32::consts::TAU * i as f32 / n as f32;
+        match self {
+            WindowShape::Hann => 0.5 - 0.5 * x.cos(),
+            WindowShape::Hamming => 0.54 - 0.46 * x.cos(),
+            WindowShape::BlackmanHarris => {
+                0.35875 - 0.48829 * x.cos() + 0.14128 * (2.0 * x).cos() - 0.01168 * (3.0 * x).cos()
+            }
+        }
+    }
+}
+
+/// Everything that decides how the spectrogram is computed. Changing any of
+/// it means analysing the track again.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Analysis {
+    pub resolution: Resolution,
+    pub time_step: TimeStep,
+    pub window: WindowShape,
+    /// Use longer windows for low notes than for high ones.
+    pub multi_resolution: bool,
+}
+
+impl Default for Analysis {
+    fn default() -> Self {
+        Analysis {
+            resolution: Resolution::default(),
+            time_step: TimeStep::default(),
+            window: WindowShape::default(),
+            multi_resolution: true,
+        }
+    }
+}
+
+/// How level maps onto the spectrogram's colours.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LevelScale {
+    /// Even steps of loudness in decibels.
+    #[default]
+    Decibel,
+    /// Square root of amplitude: between the other two.
+    SquareRoot,
+    /// Proportional to amplitude: only the loudest partials stand out.
+    Linear,
+}
+
+impl LevelScale {
+    pub const ALL: [LevelScale; 3] = [LevelScale::Decibel, LevelScale::SquareRoot, LevelScale::Linear];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LevelScale::Decibel => "Decibels (logarithmic)",
+            LevelScale::SquareRoot => "Square root",
+            LevelScale::Linear => "Linear amplitude",
+        }
+    }
+
+    /// Position on the colour scale (0..=1) of a level `below_top` dB under
+    /// the top of a `range` dB scale, with `contrast` as a gamma on the result.
+    pub fn position(self, below_top: f32, range: f32, contrast: f32) -> f32 {
+        if below_top >= range {
+            return 0.0;
+        }
+        let amplitude = 10f32.powf(-below_top.max(0.0) / 20.0);
+        let t = match self {
+            LevelScale::Decibel => 1.0 - below_top.max(0.0) / range,
+            LevelScale::SquareRoot => amplitude.sqrt(),
+            LevelScale::Linear => amplitude,
+        };
+        t.powf(contrast.clamp(0.2, 5.0))
+    }
+}
+
 /// What clicking the piano plays.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum KeySound {
@@ -178,6 +340,11 @@ pub struct Settings {
     pub loop_gap: f64,
     /// Dynamic range shown by the spectrogram, dB.
     pub range_db: f32,
+    pub analysis: Analysis,
+    pub level_scale: LevelScale,
+    /// Exponent applied to the colour position: above 1 darkens the quiet
+    /// parts, below 1 lifts them.
+    pub contrast: f32,
     /// Shifts the top of the spectrogram's colour scale, dB; positive is brighter.
     pub brightness_db: f32,
     /// Interpolate between spectrogram cells rather than show them as blocks.
@@ -236,6 +403,9 @@ impl Default for Settings {
             loop_mode: LoopMode::default(),
             loop_gap: 0.0,
             range_db: 70.0,
+            analysis: Analysis::default(),
+            level_scale: LevelScale::default(),
+            contrast: 1.0,
             brightness_db: 0.0,
             smooth: true,
             semitone_lines: false,
@@ -530,6 +700,27 @@ mod tests {
         }
         assert_eq!(Theme::Greyscale.colour(0.5), [128, 128, 128]);
         assert!(Theme::Paper.is_light() && !Theme::Inferno.is_light());
+    }
+
+    #[test]
+    fn level_scales() {
+        let at = |scale: LevelScale, db: f32| scale.position(db, 60.0, 1.0);
+        for scale in LevelScale::ALL {
+            assert_eq!(at(scale, 0.0), 1.0);
+            assert_eq!(at(scale, 60.0), 0.0);
+            assert_eq!(at(scale, -5.0), 1.0); // louder than the top of the scale
+            assert!(at(scale, 10.0) > at(scale, 30.0));
+        }
+        // 20 dB down is a tenth of the amplitude.
+        assert!((at(LevelScale::Decibel, 20.0) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((at(LevelScale::Linear, 20.0) - 0.1).abs() < 1e-6);
+        assert!((at(LevelScale::SquareRoot, 20.0) - 0.1f32.sqrt()).abs() < 1e-6);
+        assert!((LevelScale::Decibel.position(30.0, 60.0, 2.0) - 0.25).abs() < 1e-6);
+        // Every window shape peaks at 1 in the middle.
+        for window in WindowShape::ALL {
+            assert!((window.value(512, 1024) - 1.0).abs() < 1e-3);
+            assert!(window.value(0, 1024) < 0.1);
+        }
     }
 
     #[test]

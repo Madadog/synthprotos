@@ -24,8 +24,12 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
 - **Reference tones**: click or drag on the piano to hear that note, as a
   sine tone or, if set in Preferences, as any instrument from the SoundFont.
 - **Display settings** fold out at the bottom of the sidebar. Spectrogram:
-  theme, range, brightness, smoothing, octave and semitone lines, and
-  markers for the harmonics of the pitch under the cursor. Waveform: zoom,
+  theme, range, brightness, level scale (decibels, square root or linear)
+  and contrast, smoothing, octave and semitone lines, and markers for the
+  harmonics of the pitch under the cursor. Its analysis settings set the FFT
+  window length (pitch against time resolution), the time step, the window
+  shape, and whether low notes get longer windows than high ones; changing
+  them analyses the track again. Waveform: zoom,
   decibel scale, centre line and colour. In the "Both" view, drag the
   divider to resize waveform against spectrogram.
 - **Full-song seek bar** in the usual place, which also shows the bookmarks,

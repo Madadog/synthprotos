@@ -17,6 +17,7 @@ use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
 use crate::metadata::{self, Meta, MetaCache, SortColumn};
 use crate::midi::{self, MidiSong};
 use crate::playlist_io;
+use crate::session::{Analysis, LevelScale, Resolution, TimeStep, WindowShape};
 use crate::session::{Follow, KeySound, Library, LoopMode, Session, Settings, SidebarTab, Theme, ViewMode};
 use crate::track::{self, Track};
 
@@ -46,6 +47,8 @@ pub struct Loaded {
     pub track: Arc<Track>,
     pub peaks: Arc<Peaks>,
     pub spectrogram: Arc<Spectrogram>,
+    /// The settings the spectrogram was computed with.
+    analysis: Analysis,
     /// The notes, if this is a MIDI file.
     pub midi: Option<Arc<MidiSong>>,
     /// A MIDI file rendered with the built-in tone, for want of a SoundFont.
@@ -357,6 +360,19 @@ impl App {
         self.export_dialog = Some(rx);
     }
 
+    /// Analyse the open track again after a change to the analysis settings.
+    fn reanalyse(&mut self, ctx: &egui::Context) {
+        let analysis = self.settings.analysis;
+        let Some(loaded) = self.loaded.as_mut().filter(|l| l.analysis != analysis) else { return };
+        loaded.spectrogram.cancel();
+        let wake = ctx.clone();
+        loaded.spectrogram = Spectrogram::start(loaded.track.clone(), analysis, move || {
+            wake.request_repaint_after(std::time::Duration::from_millis(100))
+        });
+        loaded.analysis = analysis;
+        self.tiles = Tiles::default();
+    }
+
     fn has_midi(&self) -> bool {
         self.loaded.as_ref().is_some_and(|l| l.midi.is_some())
     }
@@ -476,7 +492,8 @@ impl App {
                 // Reopen the device at the track's rate where possible.
                 self.output = Output::open(&self.engine, Some(track.sample_rate));
                 let wake = ctx.clone();
-                let spectrogram = Spectrogram::start(track.clone(), move || {
+                let analysis = self.settings.analysis;
+                let spectrogram = Spectrogram::start(track.clone(), analysis, move || {
                     wake.request_repaint_after(std::time::Duration::from_millis(100))
                 });
                 self.view.start = 0.0;
@@ -493,7 +510,7 @@ impl App {
                 if midi.is_some() && !had_midi && self.settings.view != ViewMode::Playlist {
                     self.settings.view = ViewMode::Midi;
                 }
-                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram, midi, basic_synth });
+                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram, analysis, midi, basic_synth });
             }
         }
     }
@@ -1355,12 +1372,72 @@ impl App {
                 .on_hover_text("Dynamic range shown: lower hides quiet detail");
             ui.add(egui::Slider::new(&mut settings.brightness_db, -20.0..=30.0).step_by(1.0).suffix(" dB").text("brightness"))
                 .on_hover_text("Raise to bring out quiet notes, lower if loud ones wash out");
+            let combo_width = ui.available_width() - 70.0;
+            egui::ComboBox::from_id_salt("level-scale").width(combo_width).selected_text(settings.level_scale.label()).show_ui(
+                ui,
+                |ui| {
+                    for scale in LevelScale::ALL {
+                        ui.selectable_value(&mut settings.level_scale, scale, scale.label());
+                    }
+                },
+            );
+            ui.add(egui::Slider::new(&mut settings.contrast, 0.4..=2.5).step_by(0.05).text("contrast"))
+                .on_hover_text("Above 1 darkens the quiet parts so peaks stand out; below 1 lifts them");
             ui.checkbox(&mut settings.smooth, "Smooth").on_hover_text("Blend between cells instead of showing them as blocks");
             ui.checkbox(&mut settings.octave_lines, "Octave lines").on_hover_text("A line at every C");
             ui.checkbox(&mut settings.semitone_lines, "Semitone lines")
                 .on_hover_text("A faint line between every pair of notes, when zoomed in far enough");
             ui.checkbox(&mut settings.harmonics, "Harmonics of the hovered pitch")
                 .on_hover_text("Marks where overtones 2 to 8 of the pitch under the cursor would lie,\nto tell a played note from an overtone of a lower one");
+            ui.separator();
+            ui.label("Analysis").on_hover_text("Changing these analyses the track again");
+            let analysis = &mut settings.analysis;
+            egui::Grid::new("analysis").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                let width = (ui.available_width() - 62.0).max(80.0);
+                ui.label("Pitch").on_hover_text(
+                    "FFT window length. Higher separates close notes better but blurs when they start and stop;\n\
+                     lower does the opposite",
+                );
+                egui::ComboBox::from_id_salt("resolution").width(width).selected_text(analysis.resolution.label()).show_ui(
+                    ui,
+                    |ui| {
+                        for resolution in Resolution::ALL {
+                            let samples = resolution.window();
+                            let text = if analysis.multi_resolution {
+                                format!("{} · {}–{} samples", resolution.label(), samples, samples * 4)
+                            } else {
+                                format!("{} · {} samples", resolution.label(), samples * 2)
+                            };
+                            ui.selectable_value(&mut analysis.resolution, resolution, text);
+                        }
+                    },
+                );
+                ui.end_row();
+                ui.label("Time").on_hover_text("How often a column is taken. Finer steps cost more memory and time to analyse");
+                egui::ComboBox::from_id_salt("time-step").width(width).selected_text(analysis.time_step.label()).show_ui(
+                    ui,
+                    |ui| {
+                        for step in TimeStep::ALL {
+                            ui.selectable_value(&mut analysis.time_step, step, step.label());
+                        }
+                    },
+                );
+                ui.end_row();
+                ui.label("Window").on_hover_text("The shape applied to each slice of audio before the FFT");
+                egui::ComboBox::from_id_salt("window").width(width).selected_text(analysis.window.label()).show_ui(ui, |ui| {
+                    for window in WindowShape::ALL {
+                        ui.selectable_value(&mut analysis.window, window, window.label());
+                    }
+                });
+                ui.end_row();
+            });
+            ui.checkbox(&mut analysis.multi_resolution, "Longer windows for low notes").on_hover_text(
+                "On: bass notes get windows four times longer than the treble, so each is resolved where it matters.\n\
+                 Off: one window length for every pitch, like a conventional spectrogram",
+            );
+            if *analysis != Analysis::default() && ui.small_button("Reset analysis").clicked() {
+                *analysis = Analysis::default();
+            }
             ui.separator();
             ui.checkbox(&mut settings.piano_mode, "Piano mode").on_hover_text(
                 "Piano along the bottom, low notes on the left, with time running vertically above it.\n\
@@ -1647,6 +1724,7 @@ impl eframe::App for App {
             ctx.set_zoom_factor(self.settings.ui_scale);
         }
 
+        self.reanalyse(&ctx);
         self.follow_playhead(now);
         let region = self.loop_region();
         self.engine.lock().unwrap().set_loop(region, self.settings.loop_gap);
