@@ -2,7 +2,7 @@
 //! either a pitch grid or a linear-frequency grid, computed on background
 //! threads.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use realfft::RealFftPlanner;
@@ -88,8 +88,13 @@ pub const PITCH_MIN: f64 = 20.5;
 pub const PITCH_MAX: f64 = 120.5;
 /// Rows of the pitch grid.
 pub const ROWS: usize = ((PITCH_MAX - PITCH_MIN) as usize) * ROWS_PER_SEMITONE;
-/// Rows of the linear grid, which runs evenly from 0 Hz to the frequency of `PITCH_MAX`.
+/// Rows of the linear grid, which runs evenly from 0 Hz to the frequency of
+/// `PITCH_MAX` (or with twice the rows to half the sample rate).
 pub const LINEAR_ROWS: usize = 1024;
+
+fn freq_to_midi(hz: f64) -> f64 {
+    69.0 + 12.0 * (hz / 440.0).log2()
+}
 /// Stored levels span this many dB below full scale.
 pub const DB_RANGE: f32 = 110.0;
 /// Columns are computed (and become available) in blocks of this many.
@@ -116,9 +121,15 @@ impl Default for Job {
 /// Three FFT sizes are combined so low notes get the frequency resolution
 /// they need while high notes keep reasonable time resolution.
 pub struct Spectrogram {
+    /// Different for every analysis started, to tell them apart.
+    pub id: u64,
     pub sample_rate: u32,
     pub rows: usize,
     pub linear: bool,
+    /// Top of the pitch grid, as a MIDI note number.
+    pitch_max: f64,
+    /// Top of the linear grid, Hz.
+    top_hz: f64,
     /// Frames between columns.
     pub hop: usize,
     pub cols: usize,
@@ -138,20 +149,18 @@ struct RowMap {
 }
 
 impl Spectrogram {
-    /// Allocate the spectrogram and start computing it in the background.
-    /// `wake` is called whenever more columns become available.
-    /// Top of the linear grid, Hz.
-    fn top_hz() -> f64 {
-        midi_to_freq(PITCH_MAX)
+    /// The highest pitch the grid reaches.
+    pub fn top_pitch(&self) -> f64 {
+        if self.linear { freq_to_midi(self.top_hz) } else { self.pitch_max }
     }
 
     /// Where a pitch lies between the top (0) and bottom (1) rows, for
     /// looking it up in a texture made from the data.
     pub fn v(&self, midi: f64) -> f32 {
         if self.linear {
-            (1.0 - midi_to_freq(midi) / Self::top_hz()) as f32
+            (1.0 - midi_to_freq(midi) / self.top_hz) as f32
         } else {
-            ((PITCH_MAX - midi) / (PITCH_MAX - PITCH_MIN)) as f32
+            ((self.pitch_max - midi) / (self.pitch_max - PITCH_MIN)) as f32
         }
     }
 
@@ -159,25 +168,40 @@ impl Spectrogram {
     #[cfg(test)]
     pub fn row_pitch(&self, row: usize) -> f64 {
         if self.linear {
-            let hz = (row as f64 + 0.5) * Self::top_hz() / self.rows as f64;
-            69.0 + 12.0 * (hz / 440.0).log2()
+            freq_to_midi((row as f64 + 0.5) * self.top_hz / self.rows as f64)
         } else {
             PITCH_MIN + (row as f64 + 0.5) / ROWS_PER_SEMITONE as f64
         }
     }
 
+    /// Allocate the spectrogram and start computing it in the background.
+    /// `wake` is called whenever more columns become available.
     pub fn start(track: Arc<Track>, job: Job, wake: impl Fn() + Send + Sync + 'static) -> Arc<Spectrogram> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let analysis = job.analysis;
-        let rows = if job.linear { LINEAR_ROWS } else { ROWS };
+        let nyquist = track.sample_rate as f64 / 2.0;
+        // Normally the grid stops at C9; on request it runs to half the sample rate.
+        let (rows, pitch_max, top_hz) = match (job.linear, analysis.to_nyquist) {
+            (false, false) => (ROWS, PITCH_MAX, 0.0),
+            (false, true) => {
+                let rows = ((freq_to_midi(nyquist) - PITCH_MIN) * ROWS_PER_SEMITONE as f64).ceil().max(1.0) as usize;
+                (rows, PITCH_MIN + rows as f64 / ROWS_PER_SEMITONE as f64, 0.0)
+            }
+            (true, false) => (LINEAR_ROWS, 0.0, midi_to_freq(PITCH_MAX)),
+            (true, true) => (LINEAR_ROWS * 2, 0.0, nyquist),
+        };
         let scale = (track.sample_rate as f64 / 48000.0).ceil().max(1.0) as usize;
         let scale = scale.next_power_of_two();
         let hop = analysis.time_step.hop() * scale;
         let cols = track.frames().div_ceil(hop).max(1);
         let blocks = cols.div_ceil(BLOCK);
         let spec = Arc::new(Spectrogram {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             sample_rate: track.sample_rate,
             rows,
             linear: job.linear,
+            pitch_max,
+            top_hz,
             hop,
             cols,
             data: RwLock::new(vec![0; cols * rows]),
@@ -247,7 +271,7 @@ impl Spectrogram {
         // The band of frequencies a row covers: (low edge, centre, high edge).
         let band_of = |r: usize| -> (f64, f64, f64) {
             if self.linear {
-                let step = Self::top_hz() / rows_n as f64;
+                let step = self.top_hz / rows_n as f64;
                 (r as f64 * step, (r as f64 + 0.5) * step, (r as f64 + 1.0) * step)
             } else {
                 let pitch = PITCH_MIN + (r as f64 + 0.5) / ROWS_PER_SEMITONE as f64;
@@ -441,6 +465,29 @@ mod tests {
         let hz = |row: usize| midi_to_freq(spec.row_pitch(row));
         assert!(((hz(901) - hz(900)) - (hz(11) - hz(10))).abs() < 1e-6);
         spec.cancel();
+    }
+
+    #[test]
+    fn grid_can_run_to_half_the_sample_rate() {
+        // 15 kHz is above C9, where the grid normally stops.
+        let track = sine(15000.0, 1.0, 1.0, 44100);
+        let midi = freq_to_midi(15000.0);
+        let nyquist = Analysis { to_nyquist: true, ..Analysis::default() };
+        for linear in [false, true] {
+            let spec = Spectrogram::start(track.clone(), Job { linear, ..Job::default() }, || {});
+            assert!(spec.top_pitch() < midi);
+            spec.cancel();
+            let spec = Spectrogram::start(track.clone(), Job { analysis: nyquist, linear, ..Job::default() }, || {});
+            wait(&spec);
+            assert!((midi_to_freq(spec.top_pitch()) - 22050.0).abs() < 400.0, "top {}", spec.top_pitch());
+            let col = spec.cols / 2;
+            let column: Vec<u8> = spec.with_data(|d| d[col * spec.rows..(col + 1) * spec.rows].to_vec());
+            let (row, &value) = column.iter().enumerate().max_by_key(|(_, v)| **v).unwrap();
+            assert!((spec.row_pitch(row) - midi).abs() <= 0.25, "peak at {}", spec.row_pitch(row));
+            assert!(value >= 250, "peak level {value}");
+            let v = spec.v(spec.row_pitch(row));
+            assert!(((1.0 - v) * spec.rows as f32 - (row as f32 + 0.5)).abs() < 0.01);
+        }
     }
 
     #[test]

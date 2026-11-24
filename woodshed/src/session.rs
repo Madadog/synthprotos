@@ -92,11 +92,23 @@ pub enum Theme {
     Phosphor,
     Greyscale,
     Paper,
+    /// Amber and azure are complements: overlaid and added, they make white.
+    Amber,
+    Azure,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 7] =
-        [Theme::Inferno, Theme::Magma, Theme::Viridis, Theme::Ice, Theme::Phosphor, Theme::Greyscale, Theme::Paper];
+    pub const ALL: [Theme; 9] = [
+        Theme::Inferno,
+        Theme::Magma,
+        Theme::Viridis,
+        Theme::Ice,
+        Theme::Phosphor,
+        Theme::Greyscale,
+        Theme::Paper,
+        Theme::Amber,
+        Theme::Azure,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -107,6 +119,8 @@ impl Theme {
             Theme::Phosphor => "Phosphor",
             Theme::Greyscale => "Greyscale",
             Theme::Paper => "Paper (dark on white)",
+            Theme::Amber => "Amber",
+            Theme::Azure => "Azure",
         }
     }
 
@@ -132,6 +146,8 @@ impl Theme {
             Theme::Phosphor => &[[0, 0, 0], [0, 48, 20], [0, 110, 48], [20, 180, 80], [90, 235, 130], [225, 255, 215]],
             Theme::Greyscale => &[[0, 0, 0], [255, 255, 255]],
             Theme::Paper => &[[255, 255, 255], [0, 0, 0]],
+            Theme::Amber => &[[0, 0, 0], [255, 150, 45]],
+            Theme::Azure => &[[0, 0, 0], [0, 105, 210]],
         }
     }
 
@@ -260,6 +276,8 @@ pub struct Analysis {
     pub window: WindowShape,
     /// Use longer windows for low notes than for high ones.
     pub multi_resolution: bool,
+    /// Analyse up to half the sample rate, rather than stopping at C9.
+    pub to_nyquist: bool,
 }
 
 impl Default for Analysis {
@@ -269,6 +287,7 @@ impl Default for Analysis {
             time_step: TimeStep::default(),
             window: WindowShape::default(),
             multi_resolution: true,
+            to_nyquist: false,
         }
     }
 }
@@ -456,15 +475,21 @@ pub enum SpectrogramSource {
     Left,
     Right,
     Side,
+    /// Left and right each in their own lane.
+    SideBySide,
+    /// Left and right drawn over each other in different colours.
+    Overlaid,
 }
 
 impl SpectrogramSource {
-    pub const ALL: [SpectrogramSource; 5] = [
+    pub const ALL: [SpectrogramSource; 7] = [
         SpectrogramSource::Heard,
         SpectrogramSource::Mix,
         SpectrogramSource::Left,
         SpectrogramSource::Right,
         SpectrogramSource::Side,
+        SpectrogramSource::SideBySide,
+        SpectrogramSource::Overlaid,
     ];
 
     pub fn label(self) -> &'static str {
@@ -474,7 +499,46 @@ impl SpectrogramSource {
             SpectrogramSource::Left => "Left",
             SpectrogramSource::Right => "Right",
             SpectrogramSource::Side => "Side",
+            SpectrogramSource::SideBySide => "Left and right, side by side",
+            SpectrogramSource::Overlaid => "Left and right, overlaid",
         }
+    }
+
+    /// Whether left and right are analysed separately and shown together.
+    pub fn is_pair(self) -> bool {
+        matches!(self, SpectrogramSource::SideBySide | SpectrogramSource::Overlaid)
+    }
+}
+
+/// How overlaid left and right spectrograms combine.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Blend {
+    /// Colours add up, so sound in both channels takes the mixed colour.
+    #[default]
+    Add,
+    /// Whichever is brighter shows, per colour component.
+    Lighten,
+    /// Half of each.
+    Average,
+}
+
+impl Blend {
+    pub const ALL: [Blend; 3] = [Blend::Add, Blend::Lighten, Blend::Average];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Blend::Add => "Added",
+            Blend::Lighten => "Brighter wins",
+            Blend::Average => "Averaged",
+        }
+    }
+
+    pub fn of(self, a: [u8; 3], b: [u8; 3]) -> [u8; 3] {
+        std::array::from_fn(|i| match self {
+            Blend::Add => a[i].saturating_add(b[i]),
+            Blend::Lighten => a[i].max(b[i]),
+            Blend::Average => ((a[i] as u16 + b[i] as u16) / 2) as u8,
+        })
     }
 }
 
@@ -491,6 +555,10 @@ pub struct Stereo {
     pub invert_right: bool,
     pub wave: WaveChannels,
     pub spectrogram: SpectrogramSource,
+    /// Colour schemes of the left and right spectrograms when both are shown.
+    pub theme_left: Theme,
+    pub theme_right: Theme,
+    pub blend: Blend,
 }
 
 impl Default for Stereo {
@@ -502,6 +570,9 @@ impl Default for Stereo {
             invert_right: false,
             wave: WaveChannels::default(),
             spectrogram: SpectrogramSource::default(),
+            theme_left: Theme::Amber,
+            theme_right: Theme::Azure,
+            blend: Blend::default(),
         }
     }
 }
@@ -531,7 +602,16 @@ impl Stereo {
         then(then(then(polarity, listen), width), balance)
     }
 
-    /// The signal the spectrogram should analyse.
+    /// The signals the spectrogram should analyse: one, or left and right.
+    pub fn spectrogram_channels(&self) -> Vec<Channel> {
+        if self.spectrogram.is_pair() {
+            vec![Channel::Left, Channel::Right]
+        } else {
+            vec![self.spectrogram_channel()]
+        }
+    }
+
+    /// The signal a single spectrogram should analyse.
     pub fn spectrogram_channel(&self) -> Channel {
         let channel = match (self.spectrogram, self.listen) {
             (SpectrogramSource::Left, _) | (SpectrogramSource::Heard, Listen::Left) => Channel::Left,
@@ -590,6 +670,8 @@ pub struct Settings {
     pub semitone_lines: bool,
     /// Mark the harmonics of the pitch under the cursor.
     pub harmonics: bool,
+    /// The highest harmonic marked.
+    pub harmonic_count: u32,
     /// Piano along the bottom (low to high), time running vertically.
     pub piano_mode: bool,
     /// In piano mode: show what has been played rising from the piano,
@@ -628,6 +710,11 @@ pub struct Settings {
     pub ui_scale: f32,
     /// Speed changes time-stretch (keeping pitch) rather than resample.
     pub keep_pitch: bool,
+    /// The fastest speed on offer, as a multiple of normal.
+    pub speed_limit: f64,
+    /// The speed control runs from minus the limit to plus it, through
+    /// zero, so it can turn playback round by itself.
+    pub speed_signed: bool,
     /// When a track ends, play the next one in the playlist.
     pub auto_advance: bool,
     pub sidebar: SidebarTab,
@@ -638,6 +725,20 @@ pub struct Settings {
     /// as a sidebar tab.
     pub playlist_view: bool,
     pub last_dir: Option<PathBuf>,
+}
+
+impl Settings {
+    /// A speed brought within what the speed control offers: plus or minus
+    /// the limit, and no slower than a quarter speed unless the control
+    /// runs through zero.
+    pub fn clamp_speed(&self, speed: f64) -> f64 {
+        let limit = self.speed_limit.clamp(1.0, crate::engine::MAX_SPEED);
+        if self.speed_signed {
+            speed.clamp(-limit, limit)
+        } else {
+            speed.abs().clamp(crate::engine::MIN_SPEED, limit).copysign(speed)
+        }
+    }
 }
 
 impl Default for Settings {
@@ -658,6 +759,7 @@ impl Default for Settings {
             smooth: true,
             semitone_lines: false,
             harmonics: false,
+            harmonic_count: 8,
             piano_mode: false,
             reverse: false,
             split: 0.28,
@@ -679,6 +781,8 @@ impl Default for Settings {
             seek_step_large: 10.0,
             ui_scale: 1.0,
             keep_pitch: true,
+            speed_limit: 1.5,
+            speed_signed: false,
             auto_advance: true,
             sidebar: SidebarTab::default(),
             x11_on_wayland: true,

@@ -16,7 +16,7 @@ use crate::analysis::{Peaks, Spectrogram, BLOCK, DB_RANGE};
 use crate::app::{format_time, App, View, ACCENT, BOOKMARK, LOOP};
 use crate::midi::{MidiSong, Note};
 use crate::pitch;
-use crate::session::{Channel, FreqScale, LevelScale, LoopMode, Settings, Theme, ViewMode};
+use crate::session::{Blend, Channel, FreqScale, LevelScale, LoopMode, Settings, SpectrogramSource, Theme, ViewMode};
 use crate::track::Track;
 
 const RULER_HEIGHT: f32 = 38.0;
@@ -105,7 +105,11 @@ struct Geometry {
     /// Time runs vertically (piano mode).
     vertical: bool,
     time: Axis,
+    /// The pitch axis of the first spectrogram lane.
     pitch: Option<Axis>,
+    /// Spectrograms side by side across the pitch direction, each with its
+    /// own piano: 1, or 2 for left and right.
+    lanes: usize,
     ruler: Rect,
     /// Waveform and spectrogram together.
     body: Rect,
@@ -161,7 +165,10 @@ impl Geometry {
             // What is coming falls towards the piano: later is higher.
             Axis { origin: body.bottom(), length: -body.height().max(10.0), lo, hi, warp: FreqScale::Pitch }
         };
+        let side_by_side = settings.stereo.spectrogram == SpectrogramSource::SideBySide && mode != ViewMode::Midi;
+        let lanes = if side_by_side { 2 } else { 1 };
         let pitch = spec.map(|s| {
+            let s = lane(s, 0, lanes, !vertical);
             let (lo, hi) = (view.pitch_lo, view.pitch_hi);
             if vertical {
                 Axis { origin: s.left(), length: s.width(), lo, hi, warp: settings.freq_scale }
@@ -169,7 +176,7 @@ impl Geometry {
                 Axis { origin: s.bottom(), length: -s.height(), lo, hi, warp: settings.freq_scale }
             }
         });
-        Geometry { vertical, time, pitch, ruler, body, wave, spec, piano, timed: ruler.union(body) }
+        Geometry { vertical, time, pitch, lanes, ruler, body, wave, spec, piano, timed: ruler.union(body) }
     }
 
     /// Coordinate along the time axis.
@@ -199,7 +206,27 @@ impl Geometry {
     }
 
     fn pitch_at(&self, p: Pos2) -> Option<f64> {
-        Some(self.pitch?.value(self.across(p)))
+        Some(self.pitch_near(p)?.value(self.across(p)))
+    }
+
+    /// Each spectrogram lane: its rectangle, its piano's, and its pitch axis.
+    fn pitch_lanes(&self) -> Vec<(Rect, Rect, Axis)> {
+        let (Some(spec), Some(piano), Some(pitch)) = (self.spec, self.piano, self.pitch) else { return Vec::new() };
+        let size = self.across_range(spec).span() / self.lanes as f32;
+        (0..self.lanes)
+            .map(|i| {
+                let axis = Axis { origin: pitch.origin + size * i as f32, ..pitch };
+                (lane(spec, i, self.lanes, !self.vertical), lane(piano, i, self.lanes, !self.vertical), axis)
+            })
+            .collect()
+    }
+
+    /// The pitch axis of the lane a point is in (or nearest to).
+    fn pitch_near(&self, p: Pos2) -> Option<Axis> {
+        let lanes = self.pitch_lanes();
+        let range = self.across_range(self.spec?);
+        let index = ((self.across(p) - range.min) / range.span() * self.lanes as f32).floor();
+        lanes.get((index.max(0.0) as usize).min(self.lanes - 1)).map(|l| l.2)
     }
 
     /// A line at one moment in time, spanning `across`.
@@ -272,7 +299,8 @@ impl App {
 
     pub fn display(&mut self, ui: &mut Ui) {
         let Some(loaded) = &self.loaded else { return };
-        let (track, peaks, spectrogram) = (loaded.track.clone(), loaded.peaks.clone(), loaded.spectrogram.clone());
+        let (track, peaks) = (loaded.track.clone(), loaded.peaks.clone());
+        let (spectrograms, previous) = (loaded.spectrograms.clone(), loaded.previous.clone());
         let duration = track.duration();
         let now = ui.input(|i| i.time);
         // The MIDI view shows the file's notes where the spectrogram would be.
@@ -413,7 +441,7 @@ impl App {
         if let Some(p) = hover {
             let (scroll, pinch, alt) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta() as f64, i.modifiers.alt));
             let zoom_pitch = |view: &mut View, factor: f64| {
-                if let Some(pitch) = g.pitch {
+                if let Some(pitch) = g.pitch_near(p) {
                     (view.pitch_lo, view.pitch_hi) = pitch.zoomed(g.across(p), factor as f32);
                 }
             };
@@ -459,7 +487,7 @@ impl App {
         let g = Geometry::new(full, &self.settings, &self.view);
         let content = painter.with_clip_rect(g.timed);
         let theme = self.settings.theme;
-        let light = theme.is_light() && song.is_none();
+        let light = lane_light(&self.settings) && song.is_none();
         if let Some(rect) = g.wave {
             // One lane per channel shown, side by side across the time axis.
             let lanes = self.settings.stereo.wave.lanes();
@@ -472,32 +500,75 @@ impl App {
                 }
             }
         }
-        if let (Some(rect), Some(pitch)) = (g.spec, g.pitch) {
+        let stereo = self.settings.stereo;
+        let overlaid = stereo.spectrogram == SpectrogramSource::Overlaid;
+        // What lane `index` shows: which of the analysed channels, in which colours.
+        let lane_paint = |index: usize| -> (Vec<usize>, [Theme; 2]) {
+            match stereo.spectrogram {
+                SpectrogramSource::Overlaid => (vec![0, 1], [stereo.theme_left, stereo.theme_right]),
+                SpectrogramSource::SideBySide => (vec![index], [[stereo.theme_left, stereo.theme_right][index.min(1)]; 2]),
+                _ => (vec![0], [theme; 2]),
+            }
+        };
+        let grid = |alpha: u8, light: bool| {
+            if light { Color32::from_black_alpha(alpha * 2) } else { Color32::from_white_alpha(alpha) }
+        };
+        let peak = spectrograms.iter().map(|s| s.peak()).max().unwrap_or(0);
+        let old_peak = previous.iter().map(|s| s.peak()).max().unwrap_or(0);
+        for (index, (rect, _, pitch)) in g.pitch_lanes().into_iter().enumerate() {
             let clipped = content.with_clip_rect(rect);
+            let (channels, themes) = lane_paint(index);
+            let light = themes[0].is_light() && song.is_none();
             match &song {
                 Some(song) => draw_midi(&clipped, &g, rect, pitch, song, self.midi_hidden),
-                None => self.tiles.draw(ui.ctx(), &clipped, &g, &spectrogram, &self.settings, now),
+                None => {
+                    // The analysis being replaced stays underneath until the
+                    // new one has covered it.
+                    let layers = [(&previous, &mut self.old_tiles, old_peak), (&spectrograms, &mut self.tiles, peak)];
+                    for (set, tiles, peak) in layers {
+                        let sources: Vec<&Spectrogram> =
+                            channels.iter().filter_map(|&c| set.get(c.min(set.len().max(1) - 1))).map(|s| &**s).collect();
+                        if !sources.is_empty() {
+                            let paint = Paint { themes, blend: stereo.blend, peak };
+                            tiles[index].draw(ui.ctx(), &clipped, &g, pitch, &sources, paint, &self.settings, now);
+                        }
+                    }
+                }
             }
-            let grid = |alpha: u8| {
-                if light { Color32::from_black_alpha(alpha * 2) } else { Color32::from_white_alpha(alpha) }
-            };
             let along = g.along_range(rect);
             if self.settings.semitone_lines {
                 // Only where the notes are far enough apart to tell the lines from shading.
                 for midi in (pitch.lo.floor() as i32..=pitch.hi.ceil() as i32).filter(|m| pitch.unit_size(*m as f64) >= 5.0) {
-                    g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(9)));
+                    g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(9, light)));
                 }
             }
-            for midi in (12..=120).step_by(12).filter(|_| self.settings.octave_lines) {
-                g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(22)));
+            for midi in (12..=156).step_by(12).filter(|_| self.settings.octave_lines) {
+                g.cross_line(&clipped, pitch.at(midi as f64 - 0.5), along, Stroke::new(1.0, grid(22, light)));
             }
-            if !spectrogram.is_complete() && song.is_none() {
+            if song.is_none() && g.lanes > 1 {
+                let channel = [Channel::Left, Channel::Right][index.min(1)];
+                clipped.text(rect.left_top() + vec2(5.0, 3.0), Align2::LEFT_TOP, channel.letter(), FontId::monospace(11.0), grid(70, light));
+                if index > 0 {
+                    // A line between the lanes.
+                    g.cross_line(&clipped, g.across_range(rect).min, along, Stroke::new(1.0, RULER_BACKGROUND));
+                }
+            }
+            if song.is_none() && overlaid && index == 0 {
+                // A key to the two colour schemes.
+                for (i, (name, theme)) in [("L", stereo.theme_left), ("R", stereo.theme_right)].into_iter().enumerate() {
+                    let [r, green, b] = theme.colour(0.8);
+                    let at = rect.left_top() + vec2(5.0 + 14.0 * i as f32, 3.0);
+                    clipped.text(at, Align2::LEFT_TOP, name, FontId::monospace(11.0), Color32::from_rgb(r, green, b));
+                }
+            }
+            let done = spectrograms.iter().map(|s| s.progress()).sum::<f32>() / spectrograms.len().max(1) as f32;
+            if done < 1.0 && song.is_none() && index == 0 {
                 clipped.text(
                     rect.right_top() + vec2(-8.0, 6.0),
                     Align2::RIGHT_TOP,
-                    format!("Analysing… {:.0}%", spectrogram.progress() * 100.0),
+                    format!("Analysing… {:.0}%", done * 100.0),
                     FontId::proportional(12.0),
-                    grid(85),
+                    grid(85, light),
                 );
             }
         }
@@ -572,7 +643,7 @@ impl App {
         let hover = hover.filter(|_| matches!(self.drag, Drag::None | Drag::Select { .. } | Drag::Scrub | Drag::Piano));
         let on_pitch = |p: &Pos2| g.spec.is_some_and(|r| r.contains(*p)) || over_piano(*p);
         let hover_pitch = hover.filter(on_pitch).and_then(|p| g.pitch_at(p));
-        if let (Some(rect), Some(pitch)) = (g.piano, g.pitch) {
+        for (_, rect, pitch) in g.pitch_lanes() {
             draw_piano(&painter.with_clip_rect(rect), rect, pitch, g.vertical, hover_pitch, self.sounding);
         }
         if let Some(p) = hover.filter(|p| g.timed.contains(*p) && !over_scope(*p)) {
@@ -589,9 +660,7 @@ impl App {
             };
             g.time_line(&content, g.along(p), line_across, line);
             let mut text = format_time(g.time_at(p), if self.view.span < 2.0 { 3 } else { 2 });
-            if let (Some(midi), Some(rect), Some(pitch)) = (hover_pitch.filter(|_| in_spec), g.spec, g.pitch) {
-                let along = g.along_range(rect);
-                g.cross_line(&content, g.across(p), along, line);
+            if let Some(midi) = hover_pitch.filter(|_| in_spec) {
                 text = format!("{}   {:.1} Hz\n{text}", pitch::describe(midi), pitch::midi_to_freq(midi));
                 // In the MIDI view, say which note this is.
                 let t = g.time_at(p);
@@ -603,14 +672,33 @@ impl App {
                     Some(format!("\nch {} {}   velocity {}", note.channel + 1, channel.name(), note.velocity))
                 });
                 text += under.as_deref().unwrap_or("");
-                if self.settings.harmonics {
-                    // Where the overtones of this pitch would lie.
+                // The same pitch is marked in every lane.
+                for (rect, _, pitch) in g.pitch_lanes() {
+                    let along = g.along_range(rect);
                     let clipped = content.with_clip_rect(rect);
-                    for n in 2..=8 {
-                        let c = pitch.at(midi + 12.0 * (n as f64).log2());
+                    g.cross_line(&clipped, pitch.at(midi), along, line);
+                    if !self.settings.harmonics {
+                        continue;
+                    }
+                    // Where the overtones of this pitch would lie. High ones
+                    // crowd together: lines and numbers are thinned to fit.
+                    let (mut last_line, mut last_label) = (pitch.at(midi), pitch.at(midi));
+                    for n in 2..=self.settings.harmonic_count.clamp(2, 256) {
+                        let harmonic = midi + 12.0 * (n as f64).log2();
+                        if harmonic > pitch.hi.max(pitch.lo) {
+                            break;
+                        }
+                        let c = pitch.at(harmonic);
+                        if (c - last_line).abs() < 3.0 {
+                            continue;
+                        }
+                        last_line = c;
                         g.cross_line(&clipped, c, along, Stroke::new(1.0, colour.gamma_multiply(0.55)));
-                        let at = g.point(g.along(p) + if g.vertical { -10.0 } else { 12.0 }, c);
-                        clipped.text(at, Align2::CENTER_CENTER, format!("{n}"), FontId::monospace(10.0), colour);
+                        if (c - last_label).abs() >= if g.vertical { 9.0 * (1.0 + (n as f32).log10().floor()) } else { 11.0 } {
+                            last_label = c;
+                            let at = g.point(g.along(p) + if g.vertical { -10.0 } else { 14.0 }, c);
+                            clipped.text(at, Align2::CENTER_CENTER, format!("{n}"), FontId::monospace(10.0), colour);
+                        }
                     }
                 }
             }
@@ -983,17 +1071,29 @@ const TILE: usize = 1024;
 const TILE_BUDGET: usize = 40 * TILE * 400;
 const MAX_LEVEL: u32 = 12;
 
-/// Everything that decides a tile's pixels besides the analysis itself.
+/// Everything that decides a tile's pixels.
 #[derive(Clone, Copy, PartialEq)]
 struct Look {
+    /// The analyses drawn (the same one twice when there is only one).
+    sources: [u64; 2],
+    themes: [Theme; 2],
+    blend: Blend,
     peak: u8,
     range_db: u32,
     brightness_db: i32,
     scale: LevelScale,
     /// Hundredths, so the look can be compared exactly.
     contrast: i32,
-    theme: Theme,
     smooth: bool,
+}
+
+/// How a lane's spectrograms are coloured: a theme each, how two combine,
+/// and the level that counts as the loudest.
+#[derive(Clone, Copy)]
+struct Paint {
+    themes: [Theme; 2],
+    blend: Blend,
+    peak: u8,
 }
 
 struct Tile {
@@ -1014,28 +1114,37 @@ pub struct Tiles {
 }
 
 impl Tiles {
+    /// Draw one spectrogram, or two combined, over a pitch axis. Columns not
+    /// analysed yet are left clear, so whatever is underneath shows.
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         ctx: &egui::Context,
         painter: &Painter,
         g: &Geometry,
-        spec: &Spectrogram,
+        pitch: Axis,
+        sources: &[&Spectrogram],
+        paint: Paint,
         settings: &Settings,
         now: f64,
     ) {
-        let (Some(pitch), time) = (g.pitch, g.time) else { return };
+        let (time, spec) = (g.time, sources[0]);
+        // Two analyses are only combined when made the same way.
+        let sources = if sources.iter().all(|s| (s.cols, s.rows, s.hop) == (spec.cols, spec.rows, spec.hop)) { sources } else { &sources[..1] };
         self.frame += 1;
-        let complete = spec.is_complete();
+        let complete = sources.iter().all(|s| s.is_complete());
         let look = Look {
-            peak: spec.peak(),
+            sources: [spec.id, sources[sources.len() - 1].id],
+            themes: paint.themes,
+            blend: paint.blend,
+            peak: paint.peak,
             range_db: settings.range_db as u32,
             brightness_db: settings.brightness_db as i32,
             scale: settings.level_scale,
             contrast: (settings.contrast * 100.0).round() as i32,
-            theme: settings.theme,
             smooth: settings.smooth,
         };
-        let lut = colour_table(&look);
+        let luts = look.themes.map(|theme| colour_table(&look, theme));
         let options = if look.smooth { TextureOptions::LINEAR } else { TextureOptions::NEAREST };
 
         let cols_per_sec = spec.sample_rate as f64 / spec.hop as f64;
@@ -1049,8 +1158,8 @@ impl Tiles {
         let last = ((c1.max(0.0) as usize) / tile_cols).min((spec.cols - 1) / tile_cols);
         for index in first..=last {
             let (a, b) = (index * tile_cols, (index + 1) * tile_cols);
-            let ready = spec.blocks_ready(a, b);
-            let total = b.min(spec.cols).div_ceil(BLOCK) - a / BLOCK;
+            let ready: usize = sources.iter().map(|s| s.blocks_ready(a, b)).sum();
+            let total = (b.min(spec.cols).div_ceil(BLOCK) - a / BLOCK) * sources.len();
             let tile = self.tiles.get(&(level, index));
             let stale = match tile {
                 None => true,
@@ -1061,7 +1170,7 @@ impl Tiles {
             };
             if stale && budget > 0 && (ready > 0 || tile.is_none()) {
                 budget -= 1;
-                let image = build_tile(spec, level, index, &lut);
+                let image = build_tile(sources, level, index, &luts, look.blend);
                 let tile = Tile {
                     texture: match self.tiles.remove(&(level, index)) {
                         Some(mut old) => {
@@ -1108,7 +1217,7 @@ impl Tiles {
                 painter.add(Shape::mesh(mesh));
             }
         }
-        let max_tiles = (TILE_BUDGET / (TILE * spec.rows)).max(12);
+        let max_tiles = (TILE_BUDGET / (TILE * spec.rows)).max(8);
         if self.tiles.len() > max_tiles {
             let mut ages: Vec<u64> = self.tiles.values().map(|t| t.used).collect();
             ages.sort_unstable();
@@ -1118,43 +1227,70 @@ impl Tiles {
     }
 }
 
-fn build_tile(spec: &Spectrogram, level: u32, index: usize, lut: &[Color32; 256]) -> ColorImage {
+/// One tile's image: each texel the loudest of the columns it covers. With
+/// two sources their colours are blended. Texels whose columns have not been
+/// analysed yet are transparent.
+fn build_tile(sources: &[&Spectrogram], level: u32, index: usize, luts: &[[Color32; 256]; 2], blend: Blend) -> ColorImage {
+    let spec = sources[0];
     let step = 1usize << level;
     let first = index * TILE * step;
     let rows = spec.rows;
-    let mut pixels = vec![lut[0]; TILE * rows];
-    spec.with_data(|data| {
-        let mut column = vec![0u8; rows];
-        for x in 0..TILE {
-            let a = first + x * step;
-            if a >= spec.cols {
-                break;
+    let mut pixels = vec![Color32::TRANSPARENT; TILE * rows];
+    // The loudest value of each row over a texel's columns, per source.
+    let mut columns = vec![vec![0u8; rows]; sources.len()];
+    for x in 0..TILE {
+        let a = first + x * step;
+        if a >= spec.cols {
+            // Past the end of the track: silence.
+            for row in 0..rows {
+                pixels[row * TILE + x] = luts[0][0];
             }
-            let b = (a + step).min(spec.cols);
-            column.copy_from_slice(&data[a * rows..][..rows]);
-            for c in a + 1..b {
-                for (max, value) in column.iter_mut().zip(&data[c * rows..][..rows]) {
-                    *max = (*max).max(*value);
-                }
-            }
-            for (row, &value) in column.iter().enumerate() {
-                pixels[(rows - 1 - row) * TILE + x] = lut[value as usize];
-            }
+            continue;
         }
-    });
+        let b = (a + step).min(spec.cols);
+        if sources.iter().any(|s| s.blocks_ready(a, b) == 0) {
+            continue;
+        }
+        for (source, column) in sources.iter().zip(&mut columns) {
+            source.with_data(|data| {
+                column.copy_from_slice(&data[a * rows..][..rows]);
+                for c in a + 1..b {
+                    for (max, value) in column.iter_mut().zip(&data[c * rows..][..rows]) {
+                        *max = (*max).max(*value);
+                    }
+                }
+            });
+        }
+        for row in 0..rows {
+            let colour = luts[0][columns[0][row] as usize];
+            pixels[(rows - 1 - row) * TILE + x] = match columns.get(1) {
+                None => colour,
+                Some(second) => {
+                    let other = luts[1][second[row] as usize];
+                    let [r, g, b] = blend.of([colour.r(), colour.g(), colour.b()], [other.r(), other.g(), other.b()]);
+                    Color32::from_rgb(r, g, b)
+                }
+            };
+        }
+    }
     ColorImage::new([TILE, rows], pixels)
 }
 
-/// Map stored levels to colours: the loudest level seen (lowered by the
-/// brightness setting) is the top of the scale, and `range_db` below that is
-/// the theme's colour for silence.
-fn colour_table(look: &Look) -> [Color32; 256] {
+/// Map stored levels to a theme's colours: the loudest level seen (lowered
+/// by the brightness setting) is the top of the scale, and `range_db` below
+/// that is the theme's colour for silence.
+fn colour_table(look: &Look, theme: Theme) -> [Color32; 256] {
     let per_db = 255.0 / DB_RANGE;
     let top = look.peak.max(1) as f32 - look.brightness_db as f32 * per_db;
     let range = look.range_db as f32;
     std::array::from_fn(|value| {
         let below_top = (top - value as f32) / per_db;
-        let [r, g, b] = look.theme.colour(look.scale.position(below_top, range, look.contrast as f32 / 100.0));
+        let [r, g, b] = theme.colour(look.scale.position(below_top, range, look.contrast as f32 / 100.0));
         Color32::from_rgb(r, g, b)
     })
+}
+
+/// Whether the spectrogram's silence is light, so lines over it must be dark.
+fn lane_light(settings: &Settings) -> bool {
+    if settings.stereo.spectrogram.is_pair() { settings.stereo.theme_left.is_light() } else { settings.theme.is_light() }
 }

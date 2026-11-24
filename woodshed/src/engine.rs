@@ -19,7 +19,10 @@ use crate::pitch::midi_to_freq;
 use crate::track::Track;
 
 pub const MIN_SPEED: f64 = 0.25;
-pub const MAX_SPEED: f64 = 1.5;
+/// The fastest the engine will play, forwards or (as a negative speed) backwards.
+pub const MAX_SPEED: f64 = 8.0;
+/// Below this the transport holds still rather than play.
+const HOLD_SPEED: f64 = 0.01;
 
 pub struct Engine {
     track: Option<Arc<Track>>,
@@ -28,6 +31,7 @@ pub struct Engine {
     pos: f64,
     /// Source position of the previous stretcher frame, for loop-end detection.
     prev_pos: f64,
+    /// Negative plays backwards.
     speed: f64,
     /// Time-stretch so speed changes keep the pitch; otherwise speed works
     /// like a tape machine and pitch follows it.
@@ -189,8 +193,10 @@ impl Engine {
         if self.track.is_none() {
             return;
         }
-        if self.pos >= self.frames() - 1.0 {
+        if self.dir() > 0.0 && self.pos >= self.frames() - 1.0 {
             self.reset_to(0.0);
+        } else if self.dir() < 0.0 && self.pos <= 1.0 {
+            self.reset_to(self.frames());
         }
         self.finished = false;
         self.playing = true;
@@ -211,14 +217,20 @@ impl Engine {
     pub fn position(&self) -> f64 {
         // The FIFO is refilled only when empty, so this lies between the
         // previous and the next stretcher frame.
-        let mut p = self.pos - self.fifo.len() as f64 * self.stretch();
-        if self.pos >= self.frames() {
-            p = self.frames(); // only the final fade-out is left
+        let dir = self.dir();
+        let mut p = self.pos - dir * self.fifo.len() as f64 * self.stretch();
+        // At the end (the start, backwards) only the final fade-out is left.
+        if dir > 0.0 && self.pos >= self.frames() {
+            p = self.frames();
+        } else if dir < 0.0 && self.pos <= 0.0 {
+            p = 0.0;
         }
         if let Some((a, b)) = self.loop_region {
             // The last frame overshoots the loop end slightly before wrapping.
-            if self.prev_pos < b && p >= b {
+            if dir > 0.0 && self.prev_pos < b && p >= b {
                 p = a + (p - b);
+            } else if dir < 0.0 && self.prev_pos > a && p <= a {
+                p = b - (a - p);
             }
         }
         (p.max(0.0) / self.rate()).min(self.frames() / self.rate())
@@ -228,17 +240,31 @@ impl Engine {
         self.keep_pitch = keep_pitch;
     }
 
-    /// Source frames consumed per frame the stretcher emits.
+    /// Source frames consumed per frame the stretcher emits (in the
+    /// direction of play).
     fn stretch(&self) -> f64 {
         if self.keep_pitch {
-            self.speed
+            self.speed.abs()
         } else {
             1.0
         }
     }
 
+    /// 1 playing forwards, -1 backwards.
+    fn dir(&self) -> f64 {
+        if self.speed < 0.0 { -1.0 } else { 1.0 }
+    }
+
+    /// Playback speed as a multiple of normal; negative plays backwards,
+    /// and (nearly) zero holds the playhead still.
     pub fn set_speed(&mut self, speed: f64) {
-        self.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        let speed = speed.clamp(-MAX_SPEED, MAX_SPEED);
+        if (speed < 0.0) != (self.speed < 0.0) {
+            // Turning round: the next frame starts afresh, cross-faded.
+            self.natural = None;
+            self.prev_pos = self.pos;
+        }
+        self.speed = speed;
     }
 
     pub fn set_stereo(&mut self, matrix: [[f32; 2]; 2]) {
@@ -272,10 +298,13 @@ impl Engine {
     /// Produce the next `hop` stretched frames into the FIFO.
     fn step(&mut self, track: &Track) {
         let hop = self.hop;
+        let dir = self.dir();
+        let forward = dir > 0.0;
         if let Some((a, b)) = self.loop_region {
-            if self.prev_pos < b && self.pos >= b {
-                self.pos = a;
-                self.prev_pos = a;
+            let wrap = if forward { self.prev_pos < b && self.pos >= b } else { self.prev_pos > a && self.pos <= a };
+            if wrap {
+                self.pos = if forward { a } else { b };
+                self.prev_pos = self.pos;
                 self.natural = None;
                 if self.loop_gap > 0.0 {
                     self.flush_tail();
@@ -285,10 +314,10 @@ impl Engine {
             }
         }
         let end = track.frames() as f64;
-        if self.pos >= end {
+        if if forward { self.pos >= end } else { self.pos <= 0.0 } {
             self.flush_tail();
-            self.pos = end;
-            self.prev_pos = end;
+            self.pos = if forward { end } else { 0.0 };
+            self.prev_pos = self.pos;
             if self.playing {
                 self.playing = false;
                 self.finished = true;
@@ -296,14 +325,17 @@ impl Engine {
             return;
         }
 
-        let nominal = self.pos.round() as i64;
+        // Backwards, the stretcher works on the track mirrored about frame 0:
+        // `flip * index` is the frame in the track.
+        let flip = dir as i64;
+        let nominal = (dir * self.pos).round() as i64;
         let start = match self.natural {
             None => nominal,
             Some(nat) if (self.stretch() - 1.0).abs() < 1e-3 => nat,
-            Some(nat) => self.best_match(track, nominal, nat),
+            Some(nat) => self.best_match(track, flip, nominal, nat),
         };
         for (i, (acc, w)) in self.ola.iter_mut().zip(&self.window).enumerate() {
-            let s = track.stereo(start + i as i64);
+            let s = track.stereo(flip * (start + i as i64));
             acc[0] += s[0] * w;
             acc[1] += s[1] * w;
         }
@@ -312,25 +344,25 @@ impl Engine {
         self.ola[hop..].iter_mut().for_each(|f| *f = [0.0; 2]);
         self.natural = Some(start + hop as i64);
         self.prev_pos = self.pos;
-        self.pos += hop as f64 * self.stretch();
+        self.pos += dir * hop as f64 * self.stretch();
     }
 
     /// Find the frame start near `nominal` whose waveform best continues the
     /// previous frame (which would naturally continue at `natural`).
-    fn best_match(&mut self, track: &Track, nominal: i64, natural: i64) -> i64 {
+    fn best_match(&mut self, track: &Track, flip: i64, nominal: i64, natural: i64) -> i64 {
         if (natural - nominal).abs() <= self.search {
             return natural;
         }
         const STRIDE: usize = 4;
         let n = self.hop / STRIDE;
         self.target.clear();
-        self.target.extend((0..n).map(|j| track.mono(natural + (j * STRIDE) as i64)));
+        self.target.extend((0..n).map(|j| track.mono(flip * (natural + (j * STRIDE) as i64))));
         let target = &self.target;
         let score = |start: i64| -> f32 {
             let mut num = 0.0f32;
             let mut den = 1e-9f32;
             for (j, t) in target.iter().enumerate() {
-                let x = track.mono(start + (j * STRIDE) as i64);
+                let x = track.mono(flip * (start + (j * STRIDE) as i64));
                 num += x * t;
                 den += x * x;
             }
@@ -373,11 +405,13 @@ impl Engine {
         out.fill(0.0);
         let track = self.track.clone();
         // Without time-stretching, speed is applied here by resampling.
-        let ratio = track.as_ref().map_or(1.0, |t| t.sample_rate as f64 / self.out_rate) * (self.speed / self.stretch());
+        let held = self.speed.abs() < HOLD_SPEED;
+        let varispeed = if held { 1.0 } else { self.speed.abs() / self.stretch() };
+        let ratio = track.as_ref().map_or(1.0, |t| t.sample_rate as f64 / self.out_rate) * varispeed;
         let fade_step = (1.0 / (0.008 * self.out_rate)) as f32;
         for frame in out.chunks_mut(channels.max(1)) {
             let mut s = [0.0f32; 2];
-            if self.playing {
+            if self.playing && !held {
                 self.fade = (self.fade + fade_step).min(1.0);
             } else {
                 self.fade = (self.fade - fade_step).max(0.0);
@@ -634,6 +668,48 @@ mod tests {
             assert!((got - want).abs() < 1e-4, "frame {i}: {got} vs {want}");
         }
         assert!((e.position() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn negative_speed_plays_backwards() {
+        // A rising sweep, so every moment sounds different.
+        let n = 2 * SR as usize;
+        let mono: Vec<f32> = (0..n).map(|i| ((i as f64 / SR as f64).powi(2) * 900.0).sin() as f32 * 0.5).collect();
+        let track = Arc::new(Track::from_mono(SR, &mono));
+        let mut e = engine(track.clone());
+        e.set_speed(-1.0);
+        e.seek(1.5);
+        e.play();
+        let out = render(&mut e, SR as usize);
+        let from = (1.5 * SR as f64) as usize;
+        for (i, &got) in out.iter().enumerate().skip(4000) {
+            let want = track.samples[(from - (i - 2)) * 2];
+            assert!((got - want).abs() < 1e-4, "frame {i}: {got} vs {want}");
+        }
+        assert!((e.position() - 0.5).abs() < 0.01, "position {}", e.position());
+        // It stops at the start of the track, and playing again starts from the end.
+        render(&mut e, SR as usize);
+        assert!(!e.is_playing() && e.take_finished());
+        assert_eq!(e.position(), 0.0);
+        e.play();
+        assert!((e.position() - 2.0).abs() < 0.01);
+
+        // Backwards and slowed down, a loop is kept to from the other side.
+        e.set_speed(-0.5);
+        e.set_loop(Some((0.5, 1.0)), 0.0);
+        e.seek(0.6);
+        for _ in 0..40 {
+            render(&mut e, SR as usize / 10);
+            let p = e.position();
+            assert!((0.5..1.01).contains(&p), "position {p} left the loop");
+        }
+        assert!(e.is_playing());
+        // Speed zero holds still, silently.
+        let before = e.position();
+        e.set_speed(0.0);
+        let out = render(&mut e, SR as usize / 2);
+        assert!((e.position() - before).abs() < 0.07);
+        assert!(out[SR as usize / 4..].iter().all(|s| s.abs() < 1e-6));
     }
 
     #[test]

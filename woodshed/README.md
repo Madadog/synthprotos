@@ -27,17 +27,22 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
   theme, frequency axis (pitch, mel, or linear hertz, which is analysed on
   its own evenly spaced grid), range, brightness,
   level scale (decibels, square root or linear) and contrast, smoothing, octave and semitone lines, and markers for the
-  harmonics of the pitch under the cursor. Its analysis settings set the FFT
+  harmonics of the pitch under the cursor (up to a chosen number, at most
+  256). Its analysis settings set the FFT
   window length (pitch against time resolution), the time step, the window
-  shape, and whether low notes get longer windows than high ones; changing
-  them analyses the track again. Waveform: zoom,
+  shape, whether low notes get longer windows than high ones, and whether
+  the spectrogram stops at C9 or runs to half the sample rate; changing
+  them analyses the track again, with the old picture staying on screen
+  until each stretch of the new one is ready. Waveform: zoom,
   decibel scale, centre line and colour. In the "Both" view, drag the
   divider to resize waveform against spectrogram.
 - **Stereo**: a third fold-out section. Listen to the left or right channel
   alone, the mid, or the side (which drops whatever is centred, often the
   lead vocal); adjust balance and width; invert the right channel. The
   waveform can show left and right, or mid and side, in separate lanes, and
-  the spectrogram can analyse any one of them.
+  the spectrogram can analyse any one of them, or show left and right
+  together: side by side, each with its own piano, or overlaid in two
+  colour schemes that are added, averaged, or merged by taking the brighter.
 - **Oscilloscope mode** for the waveform: a live, triggered trace of the
   audio at the playhead, or left plotted against right.
 - **Full-song seek bar** in the usual place, which also shows the bookmarks,
@@ -52,7 +57,9 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
   and speed are remembered per file.
 - **Speed** from 25% to 150%. With "Keep pitch" on it time-stretches, so the
   notes stay where they are; with it off it resamples like a tape machine,
-  so half speed is also an octave down.
+  so half speed is also an octave down. "Reverse" (`R`) plays backwards.
+  Preferences can raise the fastest speed (up to 800%) and make the speed
+  control run from minus that to plus it, through zero into reverse.
 - **Playlists**: any number of named playlists of files. Add files from the
   playlist tab, by dropping several on the window, or on the command line.
   `N` and `P` skip between tracks, and the next track starts by itself when
@@ -67,8 +74,9 @@ the hard bar, and read the notes off a pitch-axis spectrogram.
   and type read from the files' tags; clicking a column header sorts the
   playlist by it (again to reverse). Off, the playlist is a compact list in
   the sidebar.
-- **Spectrogram themes**: Inferno, Magma, Viridis, Ice, Phosphor, Greyscale
-  and Paper (dark on white).
+- **Spectrogram themes**: Inferno, Magma, Viridis, Ice, Phosphor, Greyscale,
+  Paper (dark on white), and the complementary pair Amber and Azure for
+  overlaying left and right.
 - **Preferences** (`Ctrl+,`): playback behaviour, seek steps, playhead
   following, interface size, spectrogram theme and range.
 
@@ -113,6 +121,7 @@ it has its own `Cargo.lock`.
 | `Home` | Back to the start |
 | `↑` `↓` | Speed up / slow down by 5% |
 | `T` | Speed keeps pitch (time-stretch) on / off |
+| `R` | Play backwards / forwards |
 | `N` `P` | Next / previous track in the playlist |
 | `B` | Drop a bookmark at the playhead (`Shift+B`: and name it) |
 | `[` `]` | Previous / next bookmark (also `PgUp` / `PgDn`) |

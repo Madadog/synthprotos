@@ -14,6 +14,7 @@ use eframe::egui::{
 use crate::analysis::{Job, Peaks, Spectrogram, PITCH_MAX, PITCH_MIN};
 use crate::display::{Drag, Tiles};
 use crate::engine::{Engine, Output, MAX_SPEED, MIN_SPEED};
+use crate::session::Blend;
 use crate::metadata::{self, Meta, MetaCache, SortColumn};
 use crate::midi::{self, MidiSong};
 use crate::playlist_io;
@@ -47,9 +48,12 @@ enum PlaylistAction {
 pub struct Loaded {
     pub track: Arc<Track>,
     pub peaks: Arc<Peaks>,
-    pub spectrogram: Arc<Spectrogram>,
-    /// What the spectrogram was computed from, and how.
-    job: Job,
+    /// One spectrogram, or two for left and right.
+    pub spectrograms: Vec<Arc<Spectrogram>>,
+    /// What each spectrogram was computed from, and how.
+    jobs: Vec<Job>,
+    /// The analysis being replaced, shown until the new one has caught up.
+    pub previous: Vec<Arc<Spectrogram>>,
     /// The notes, if this is a MIDI file.
     pub midi: Option<Arc<MidiSong>>,
     /// A MIDI file rendered with the built-in tone, for want of a SoundFont.
@@ -109,7 +113,10 @@ pub struct App {
     cue: f64,
 
     pub view: View,
-    pub tiles: Tiles,
+    /// Spectrogram textures, per lane of the display.
+    pub tiles: [Tiles; 2],
+    /// Textures of the analysis being replaced.
+    pub old_tiles: [Tiles; 2],
     pub drag: Drag,
     /// When the user last panned the display by hand.
     pub last_pan: f64,
@@ -172,7 +179,8 @@ impl App {
             playing: false,
             cue: 0.0,
             view: View { start: 0.0, span: 30.0, pitch_lo: 33.0, pitch_hi: 96.0 },
-            tiles: Tiles::default(),
+            tiles: Default::default(),
+            old_tiles: Default::default(),
             drag: Drag::None,
             last_pan: f64::NEG_INFINITY,
             fullscreen: false,
@@ -361,27 +369,53 @@ impl App {
         self.export_dialog = Some(rx);
     }
 
-    /// What the spectrogram should be computed from: the analysis settings,
-    /// a linear grid for the linear axis, and the channel being examined.
-    fn job(&self) -> Job {
-        Job {
-            analysis: self.settings.analysis,
-            linear: self.settings.freq_scale == FreqScale::Linear,
-            channel: self.settings.stereo.spectrogram_channel(),
-        }
+    /// What the spectrograms should be computed from: the analysis settings,
+    /// a linear grid for the linear axis, and the channels being examined.
+    fn jobs(&self) -> Vec<Job> {
+        let linear = self.settings.freq_scale == FreqScale::Linear;
+        let channels = self.settings.stereo.spectrogram_channels();
+        channels.into_iter().map(|channel| Job { analysis: self.settings.analysis, linear, channel }).collect()
+    }
+
+    fn start_analysis(track: &Arc<Track>, job: Job, ctx: &egui::Context) -> Arc<Spectrogram> {
+        let wake = ctx.clone();
+        Spectrogram::start(track.clone(), job, move || wake.request_repaint_after(std::time::Duration::from_millis(100)))
     }
 
     /// Analyse the open track again after a change to the analysis settings.
+    /// What was there stays on show until the new analysis has replaced it.
     fn reanalyse(&mut self, ctx: &egui::Context) {
-        let job = self.job();
-        let Some(loaded) = self.loaded.as_mut().filter(|l| l.job != job) else { return };
-        loaded.spectrogram.cancel();
-        let wake = ctx.clone();
-        loaded.spectrogram = Spectrogram::start(loaded.track.clone(), job, move || {
-            wake.request_repaint_after(std::time::Duration::from_millis(100))
-        });
-        loaded.job = job;
-        self.tiles = Tiles::default();
+        let jobs = self.jobs();
+        let Some(loaded) = self.loaded.as_mut() else { return };
+        let complete = loaded.spectrograms.iter().all(|s| s.is_complete());
+        if loaded.jobs == jobs {
+            if complete && !loaded.previous.is_empty() {
+                loaded.previous.clear();
+                self.old_tiles = Default::default();
+            }
+            return;
+        }
+        // Keep whatever is already being computed the right way.
+        let existing = |job: &Job| loaded.jobs.iter().position(|j| j == job).map(|i| loaded.spectrograms[i].clone());
+        let fresh: Vec<_> =
+            jobs.iter().map(|job| existing(job).unwrap_or_else(|| Self::start_analysis(&loaded.track, *job, ctx))).collect();
+        let old = std::mem::replace(&mut loaded.spectrograms, fresh);
+        for spectrogram in old.iter().filter(|o| !loaded.spectrograms.iter().any(|s| s.id == o.id)) {
+            spectrogram.cancel();
+        }
+        loaded.jobs = jobs;
+        // An unfinished analysis does not displace a finished one underneath.
+        if complete || loaded.previous.is_empty() {
+            loaded.previous = old;
+            self.old_tiles = std::mem::take(&mut self.tiles);
+        } else {
+            self.tiles = Default::default();
+        }
+    }
+
+    /// The highest pitch the display can show.
+    fn top_pitch(&self) -> f64 {
+        self.loaded.as_ref().and_then(|l| l.spectrograms.first()).map_or(PITCH_MAX, |s| s.top_pitch())
     }
 
     fn has_midi(&self) -> bool {
@@ -485,7 +519,7 @@ impl App {
                 self.save_session();
                 let had_midi = self.has_midi();
                 if let Some(old) = self.loaded.take() {
-                    old.spectrogram.cancel();
+                    old.spectrograms.iter().for_each(|s| s.cancel());
                 }
                 let track = Arc::new(track);
                 self.session = Session::load(&track.path);
@@ -495,6 +529,7 @@ impl App {
                 {
                     let mut engine = self.engine.lock().unwrap();
                     engine.set_track(Some(track.clone()));
+                    self.session.speed = self.settings.clamp_speed(self.session.speed);
                     engine.set_speed(self.session.speed);
                     if std::mem::take(&mut self.autoplay) {
                         engine.play();
@@ -502,14 +537,12 @@ impl App {
                 }
                 // Reopen the device at the track's rate where possible.
                 self.output = Output::open(&self.engine, Some(track.sample_rate));
-                let wake = ctx.clone();
-                let job = self.job();
-                let spectrogram = Spectrogram::start(track.clone(), job, move || {
-                    wake.request_repaint_after(std::time::Duration::from_millis(100))
-                });
+                let jobs = self.jobs();
+                let spectrograms = jobs.iter().map(|job| Self::start_analysis(&track, *job, ctx)).collect();
                 self.view.start = 0.0;
                 self.view.span = track.duration().min(30.0);
-                self.tiles = Tiles::default();
+                self.tiles = Default::default();
+                self.old_tiles = Default::default();
                 self.pos = 0.0;
                 self.cue = 0.0;
                 self.drag = Drag::None;
@@ -521,7 +554,8 @@ impl App {
                 if midi.is_some() && !had_midi && self.settings.view != ViewMode::Playlist {
                     self.settings.view = ViewMode::Midi;
                 }
-                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrogram, job, midi, basic_synth });
+                let previous = Vec::new();
+                self.loaded = Some(Loaded { track, peaks: Arc::new(peaks), spectrograms, jobs, previous, midi, basic_synth });
             }
         }
     }
@@ -611,9 +645,28 @@ impl App {
     }
 
     fn set_speed(&mut self, speed: f64) {
-        self.session.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        self.session.speed = self.settings.clamp_speed(speed);
         self.engine.lock().unwrap().set_speed(self.session.speed);
         self.touch_session();
+    }
+
+    /// Change speed by `step`: faster or slower in the direction of play, or
+    /// through zero when the speed control runs that way.
+    fn nudge_speed(&mut self, step: f64) {
+        let speed = self.session.speed;
+        let nudged = if self.settings.speed_signed { speed + step } else { (speed.abs() + step).copysign(speed) };
+        self.set_speed((nudged * 20.0).round() / 20.0);
+    }
+
+    /// Normal speed, in the direction of play (forwards, when the speed
+    /// control itself sets the direction).
+    fn normal_speed(&self) -> f64 {
+        if self.settings.speed_signed { 1.0 } else { 1f64.copysign(self.session.speed) }
+    }
+
+    /// Turn playback round.
+    fn toggle_reverse(&mut self) {
+        self.set_speed(-self.session.speed);
     }
 
     fn set_keep_pitch(&mut self, keep_pitch: bool) {
@@ -654,8 +707,9 @@ impl App {
         } else {
             self.view.start = self.view.start.clamp(0.0, duration - self.view.span);
         }
-        let range = (self.view.pitch_hi - self.view.pitch_lo).clamp(6.0, PITCH_MAX - PITCH_MIN);
-        self.view.pitch_lo = self.view.pitch_lo.clamp(PITCH_MIN, PITCH_MAX - range);
+        let top = self.top_pitch();
+        let range = (self.view.pitch_hi - self.view.pitch_lo).clamp(6.0, top - PITCH_MIN);
+        self.view.pitch_lo = self.view.pitch_lo.clamp(PITCH_MIN, top - range);
         self.view.pitch_hi = self.view.pitch_lo + range;
     }
 
@@ -679,6 +733,12 @@ impl App {
         }
         match self.settings.follow {
             Follow::Off => {}
+            Follow::Page if self.session.speed < 0.0 => {
+                // Backwards, pages turn the other way.
+                if self.pos < self.view.start + self.view.span * 0.03 || self.pos > self.view.start + self.view.span {
+                    self.view.start = self.pos - self.view.span * 0.97;
+                }
+            }
             Follow::Page => {
                 if self.pos < self.view.start || self.pos > self.view.start + self.view.span * 0.97 {
                     self.view.start = self.pos - self.view.span * 0.03;
@@ -791,10 +851,13 @@ impl App {
             self.seek_and_show(0.0);
         }
         if key(Key::ArrowUp) {
-            self.set_speed(((self.session.speed + 0.05) * 20.0).round() / 20.0);
+            self.nudge_speed(0.05);
         }
         if key(Key::ArrowDown) {
-            self.set_speed(((self.session.speed - 0.05) * 20.0).round() / 20.0);
+            self.nudge_speed(-0.05);
+        }
+        if key(Key::R) {
+            self.toggle_reverse();
         }
         if key(Key::Equals) || key(Key::Plus) || shift(Key::Plus) || shift(Key::Equals) {
             self.zoom_time(0.5, self.pos.clamp(self.view.start, self.view.start + self.view.span));
@@ -832,8 +895,10 @@ impl App {
                              Choose a SoundFont (.sf2) in Preferences for real instrument sounds.",
                         );
                     }
-                    if !loaded.spectrogram.is_complete() {
-                        ui.weak(format!("· analysing {:.0}%", loaded.spectrogram.progress() * 100.0));
+                    let specs = &loaded.spectrograms;
+                    let progress = specs.iter().map(|s| s.progress()).sum::<f32>() / specs.len().max(1) as f32;
+                    if progress < 1.0 {
+                        ui.weak(format!("· analysing {:.0}%", progress * 100.0));
                     }
                 }
                 _ => {}
@@ -1239,6 +1304,26 @@ impl App {
                     reset_button(ui, &mut keep_pitch, defaults.keep_pitch);
                 });
                 ui.end_row();
+                ui.label("Fastest speed");
+                ui.horizontal(|ui| {
+                    let mut percent = settings.speed_limit * 100.0;
+                    slider(ui, &mut percent, defaults.speed_limit * 100.0, |v| {
+                        egui::Slider::new(v, 100.0..=MAX_SPEED * 100.0).step_by(10.0).suffix("%")
+                    })
+                    .on_hover_text("How far the speed control goes");
+                    settings.speed_limit = percent / 100.0;
+                    reset_button(ui, &mut settings.speed_limit, defaults.speed_limit);
+                });
+                ui.end_row();
+                ui.label("Speed control");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut settings.speed_signed, "Runs through zero into reverse").on_hover_text(
+                        "On: the speed control goes from minus the fastest speed to plus it, so dragging it below \
+                         zero plays backwards.\nOff: it starts at 25%, and only the Reverse checkbox turns playback round",
+                    );
+                    reset_button(ui, &mut settings.speed_signed, defaults.speed_signed);
+                });
+                ui.end_row();
                 ui.label("When a track ends");
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut settings.auto_advance, "Play the next one in the playlist")
@@ -1409,18 +1494,35 @@ impl App {
         let slider_width = (ui.available_width() - 150.0).max(60.0);
         ui.spacing_mut().slider_width = slider_width;
         egui::CollapsingHeader::new(RichText::new("Spectrogram").strong()).id_salt("spectrogram-settings").show(ui, |ui| {
-            egui::ComboBox::from_id_salt("theme").width(ui.available_width() - 8.0).selected_text(settings.theme.label()).show_ui(
-                ui,
-                |ui| {
-                    for theme in Theme::ALL {
-                        ui.horizontal(|ui| {
-                            theme_swatch(ui, theme, 48.0);
-                            ui.selectable_value(&mut settings.theme, theme, theme.label());
+            if settings.stereo.spectrogram.is_pair() {
+                // Left and right are both on show, each in its own colours.
+                let width = ui.available_width() - 60.0;
+                for (name, theme) in [("left", &mut settings.stereo.theme_left), ("right", &mut settings.stereo.theme_right)] {
+                    ui.horizontal(|ui| {
+                        theme_combo(ui, name, theme, width);
+                        ui.label(name);
+                    });
+                    theme_swatch(ui, *theme, ui.available_width() - 8.0);
+                }
+                if settings.stereo.spectrogram == SpectrogramSource::Overlaid {
+                    ui.horizontal(|ui| {
+                        let blend = &mut settings.stereo.blend;
+                        egui::ComboBox::from_id_salt("blend").width(width).selected_text(blend.label()).show_ui(ui, |ui| {
+                            for choice in Blend::ALL {
+                                ui.selectable_value(blend, choice, choice.label());
+                            }
                         });
-                    }
-                },
-            );
-            theme_swatch(ui, settings.theme, ui.available_width() - 8.0);
+                        ui.label("blend").on_hover_text(
+                            "How the two channels' colours combine where they overlap.\n\
+                             Added, with complementary schemes such as Amber and Azure, shows centred sound \
+                             in white and sound on one side in that side's colour",
+                        );
+                    });
+                }
+            } else {
+                theme_combo(ui, "theme", &mut settings.theme, ui.available_width() - 8.0);
+                theme_swatch(ui, settings.theme, ui.available_width() - 8.0);
+            }
             slider(ui, &mut settings.range_db, Settings::default().range_db, |v| egui::Slider::new(v, 30.0..=100.0).step_by(1.0).suffix(" dB").text("range"))
                 .on_hover_text("Dynamic range shown: lower hides quiet detail");
             slider(ui, &mut settings.brightness_db, Settings::default().brightness_db, |v| egui::Slider::new(v, -20.0..=30.0).step_by(1.0).suffix(" dB").text("brightness"))
@@ -1455,8 +1557,15 @@ impl App {
             ui.checkbox(&mut settings.octave_lines, "Octave lines").on_hover_text("A line at every C");
             ui.checkbox(&mut settings.semitone_lines, "Semitone lines")
                 .on_hover_text("A faint line between every pair of notes, when zoomed in far enough");
-            ui.checkbox(&mut settings.harmonics, "Harmonics of the hovered pitch")
-                .on_hover_text("Marks where overtones 2 to 8 of the pitch under the cursor would lie,\nto tell a played note from an overtone of a lower one");
+            ui.checkbox(&mut settings.harmonics, "Harmonics of the hovered pitch").on_hover_text(
+                "Marks where the overtones of the pitch under the cursor would lie,\nto tell a played note from an overtone of a lower one",
+            );
+            ui.add_enabled_ui(settings.harmonics, |ui| {
+                slider(ui, &mut settings.harmonic_count, Settings::default().harmonic_count, |v| {
+                    egui::Slider::new(v, 2..=256).logarithmic(true).text("harmonics")
+                })
+                .on_hover_text("The highest overtone marked. Where they crowd together only some are drawn");
+            });
             ui.separator();
             ui.label("Analysis").on_hover_text("Changing these analyses the track again");
             let analysis = &mut settings.analysis;
@@ -1502,6 +1611,10 @@ impl App {
             ui.checkbox(&mut analysis.multi_resolution, "Longer windows for low notes").on_hover_text(
                 "On: bass notes get windows four times longer than the treble, so each is resolved where it matters.\n\
                  Off: one window length for every pitch, like a conventional spectrogram",
+            );
+            ui.checkbox(&mut analysis.to_nyquist, "Up to half the sample rate").on_hover_text(
+                "Off: the spectrogram stops at C9 (about 8.4 kHz), above the highest note of a piano.\n\
+                 On: it runs to the highest frequency the file can hold (22 kHz for CD audio)",
             );
             if *analysis != Analysis::default() && ui.small_button("Reset analysis").clicked() {
                 *analysis = Analysis::default();
@@ -1588,6 +1701,8 @@ impl App {
                 });
                 ui.label("spectrogram").on_hover_text(
                     "Which signal the spectrogram analyses. \"What is heard\" follows the channel chosen above.\n\
+                     Left and right can also be shown together: side by side, each with its own piano, or \
+                     overlaid in two colour schemes (chosen under Spectrogram).\n\
                      Changing it analyses the track again",
                 );
             });
@@ -1649,18 +1764,30 @@ impl App {
             self.loop_combo(ui, 130.0);
             ui.separator();
             ui.label("Speed");
-            let mut percent = self.session.speed * 100.0;
-            let slider = egui::Slider::new(&mut percent, MIN_SPEED * 100.0..=MAX_SPEED * 100.0)
-                .step_by(1.0)
-                .suffix("%");
-            let speed = ui.add(slider).on_hover_text("Playback speed (↑ / ↓). Double-click for normal speed");
-            if double_clicked(ui, &speed) {
-                self.set_speed(1.0);
-            } else if speed.changed() {
-                self.set_speed(percent / 100.0);
+            let signed = self.settings.speed_signed;
+            let limit = self.settings.speed_limit.clamp(1.0, MAX_SPEED) * 100.0;
+            let speed = self.session.speed;
+            let mut percent = if signed { speed * 100.0 } else { speed.abs() * 100.0 };
+            let range = if signed { -limit..=limit } else { MIN_SPEED * 100.0..=limit };
+            let slider = egui::Slider::new(&mut percent, range).step_by(1.0).suffix("%");
+            let hint = if signed {
+                "Playback speed (↑ / ↓); below zero plays backwards. Double-click for normal speed"
+            } else {
+                "Playback speed (↑ / ↓). Double-click for normal speed"
+            };
+            let response = ui.add(slider).on_hover_text(hint);
+            if double_clicked(ui, &response) {
+                self.set_speed(self.normal_speed());
+            } else if response.changed() {
+                self.set_speed(if signed { percent / 100.0 } else { (percent / 100.0).copysign(speed) });
             }
-            if ui.add_enabled(self.session.speed != 1.0, egui::Button::new("1×")).on_hover_text("Back to normal speed").clicked() {
-                self.set_speed(1.0);
+            let normal = self.normal_speed();
+            if ui.add_enabled(speed != normal, egui::Button::new("1×")).on_hover_text("Back to normal speed").clicked() {
+                self.set_speed(normal);
+            }
+            let mut reverse = speed < 0.0;
+            if ui.checkbox(&mut reverse, "Reverse").on_hover_text("Play backwards (R)").changed() {
+                self.toggle_reverse();
             }
             let mut keep_pitch = self.settings.keep_pitch;
             let hint = "On: time-stretch, so slowing down keeps the pitch.\n\
@@ -1739,6 +1866,7 @@ impl App {
             ("Home", "Back to the start"),
             ("↑ / ↓", "Speed up / slow down by 5%"),
             ("T", "Speed keeps pitch (time-stretch) on / off"),
+            ("R", "Play backwards / forwards"),
             ("N / P", "Next / previous track in the playlist"),
             ("B", "Drop a bookmark at the playhead (Shift+B: and name it)"),
             ("[ / ]", "Previous / next bookmark (also PgUp / PgDn)"),
@@ -1811,7 +1939,7 @@ impl eframe::App for App {
         if finished {
             // Move on through the playlist, unless a loop is being rehearsed.
             self.playing = true;
-            let advance = self.settings.auto_advance && self.settings.loop_mode == LoopMode::Off;
+            let advance = self.settings.auto_advance && self.settings.loop_mode == LoopMode::Off && self.session.speed > 0.0;
             if !(advance && self.playlist_step(1, &ctx)) {
                 self.playing = false;
                 if self.settings.return_on_pause {
@@ -1859,6 +1987,10 @@ impl eframe::App for App {
             ctx.set_zoom_factor(self.settings.ui_scale);
         }
 
+        // The speed stays within what the preferences now allow.
+        if self.loaded.is_some() && self.settings.clamp_speed(self.session.speed) != self.session.speed {
+            self.set_speed(self.session.speed);
+        }
         self.reanalyse(&ctx);
         self.follow_playhead(now);
         let region = self.loop_region();
@@ -1934,6 +2066,18 @@ fn reset_button<T: PartialEq>(ui: &mut Ui, value: &mut T, default: T) -> bool {
         *value = default;
     }
     clicked
+}
+
+/// A drop-down of the spectrogram themes, each with a sample.
+fn theme_combo(ui: &mut Ui, id: &str, theme: &mut Theme, width: f32) {
+    egui::ComboBox::from_id_salt(id).width(width).selected_text(theme.label()).show_ui(ui, |ui| {
+        for choice in Theme::ALL {
+            ui.horizontal(|ui| {
+                theme_swatch(ui, choice, 48.0);
+                ui.selectable_value(theme, choice, choice.label());
+            });
+        }
+    });
 }
 
 /// A strip showing a spectrogram theme from quiet to loud.
